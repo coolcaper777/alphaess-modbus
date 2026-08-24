@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<Actions>
+    <!-- uiPath="hidden" keeps these out of the Action Group picker - they exist
+         only to be reachable over HTTP at
+         http://<host>:8176/message/com.coolcaper.alphaessmodbus/<id>, per
+         Indigo's official Example HTTP Responder pattern
+         (github.com/IndigoDomotics/IndigoSDK). -->
+    <Action id="dashboard" uiPath="hidden">
+        <Name>AlphaESS dashboard page</Name>
+        <CallbackMethod>dashboard</CallbackMethod>
+    </Action>
+    <Action id="dashboard_data" uiPath="hidden">
+        <Name>AlphaESS dashboard live data</Name>
+        <CallbackMethod>dashboard_data</CallbackMethod>
+    </Action>
+</Actions>

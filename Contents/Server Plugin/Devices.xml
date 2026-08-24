@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<Devices>
+    <Device type="custom" id="inverter">
+        <Name>AlphaESS Inverter</Name>
+        <ConfigUI>
+            <Field id="address" type="textfield">
+                <Label>Inverter IP Address:</Label>
+                <Description>Local IP of the inverter's LAN port (Modbus TCP is not available over Wi-Fi)</Description>
+            </Field>
+            <Field id="port" type="textfield" defaultValue="502">
+                <Label>Modbus TCP Port:</Label>
+            </Field>
+            <!-- AlphaESS inverters only ever answer on unit/slave ID 0x55 (85) -
+                 it's not configurable on the inverter itself, but exposing it
+                 avoids hardcoding a magic number future models might change. -->
+            <Field id="unitId" type="textfield" defaultValue="85">
+                <Label>Modbus Unit/Slave ID:</Label>
+                <Description>AlphaESS inverters use 85 (0x55) - only change this if yours differs</Description>
+            </Field>
+            <Field id="pollInterval" type="textfield" defaultValue="30">
+                <Label>Poll Interval (seconds):</Label>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="pvPower">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV Power Changed</TriggerLabel>
+                <ControlPageLabel>PV Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="gridPower">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Grid Power Changed</TriggerLabel>
+                <ControlPageLabel>Grid Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="batteryPower">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Power Changed</TriggerLabel>
+                <ControlPageLabel>Battery Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="batterySoC">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery State of Charge Changed</TriggerLabel>
+                <ControlPageLabel>Battery SoC</ControlPageLabel>
+                <Units>%</Units>
+            </State>
+            <State id="batterySoH">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery State of Health Changed</TriggerLabel>
+                <ControlPageLabel>Battery SoH</ControlPageLabel>
+                <Units>%</Units>
+            </State>
+            <State id="loadPower">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>House Load Power Changed</TriggerLabel>
+                <ControlPageLabel>House Load</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="lifetimeFeedToGrid">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Lifetime Energy Fed to Grid Changed</TriggerLabel>
+                <ControlPageLabel>Lifetime Feed to Grid</ControlPageLabel>
+                <Units>kWh</Units>
+            </State>
+            <State id="lifetimeConsumedFromGrid">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Lifetime Energy Consumed from Grid Changed</TriggerLabel>
+                <ControlPageLabel>Lifetime Consumed from Grid</ControlPageLabel>
+                <Units>kWh</Units>
+            </State>
+        </States>
+        <UiDisplayStateId>batterySoC</UiDisplayStateId>
+    </Device>
+</Devices>

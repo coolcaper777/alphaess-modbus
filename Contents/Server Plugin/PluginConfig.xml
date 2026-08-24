@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <Field id="showDebugInfo" type="checkbox" defaultValue="false">
+        <Label>Enable Debug Logging:</Label>
+        <Description>Logs Modbus register reads/decodes for each inverter in detail.</Description>
+    </Field>
+</PluginConfig>
