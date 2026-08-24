@@ -22,18 +22,160 @@
             </Field>
         </ConfigUI>
         <States>
+            <State id="loadPower">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>House Load Power Changed</TriggerLabel>
+                <ControlPageLabel>House Load</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="invTemperature">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Inverter Temperature Changed</TriggerLabel>
+                <ControlPageLabel>Inverter Temperature</ControlPageLabel>
+                <Units>°C</Units>
+            </State>
+        </States>
+        <UiDisplayStateId>loadPower</UiDisplayStateId>
+    </Device>
+
+    <Device type="custom" id="solarDevice">
+        <Name>AlphaESS Solar</Name>
+        <ConfigUI>
+            <Field id="systemDevice" type="menu">
+                <Label>AlphaESS Inverter:</Label>
+                <Description>Which inverter this solar device belongs to</Description>
+                <List class="self" method="get_inverters" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+        <States>
             <State id="pvPower">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>PV Power Changed</TriggerLabel>
                 <ControlPageLabel>PV Power</ControlPageLabel>
                 <Units>W</Units>
             </State>
-            <State id="gridPower">
+            <State id="pv1Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 1 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 1 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv1Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 1 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 1 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv1Power">
                 <ValueType>Integer</ValueType>
-                <TriggerLabel>Grid Power Changed</TriggerLabel>
-                <ControlPageLabel>Grid Power</ControlPageLabel>
+                <TriggerLabel>PV String 1 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 1 Power</ControlPageLabel>
                 <Units>W</Units>
             </State>
+            <State id="pv2Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 2 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 2 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv2Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 2 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 2 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv2Power">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV String 2 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 2 Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="pv3Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 3 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 3 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv3Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 3 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 3 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv3Power">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV String 3 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 3 Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="pv4Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 4 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 4 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv4Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 4 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 4 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv4Power">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV String 4 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 4 Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="pv5Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 5 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 5 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv5Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 5 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 5 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv5Power">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV String 5 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 5 Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="pv6Voltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 6 Voltage Changed</TriggerLabel>
+                <ControlPageLabel>String 6 Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="pv6Current">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>PV String 6 Current Changed</TriggerLabel>
+                <ControlPageLabel>String 6 Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="pv6Power">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>PV String 6 Power Changed</TriggerLabel>
+                <ControlPageLabel>String 6 Power</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+        </States>
+        <UiDisplayStateId>pvPower</UiDisplayStateId>
+    </Device>
+
+    <Device type="custom" id="batteryDevice">
+        <Name>AlphaESS Battery</Name>
+        <ConfigUI>
+            <Field id="systemDevice" type="menu">
+                <Label>AlphaESS Inverter:</Label>
+                <Description>Which inverter this battery device belongs to</Description>
+                <List class="self" method="get_inverters" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+        <States>
             <State id="batteryPower">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Battery Power Changed</TriggerLabel>
@@ -43,20 +185,106 @@
             <State id="batterySoC">
                 <ValueType>Number</ValueType>
                 <TriggerLabel>Battery State of Charge Changed</TriggerLabel>
-                <ControlPageLabel>Battery SoC</ControlPageLabel>
+                <ControlPageLabel>State of Charge</ControlPageLabel>
                 <Units>%</Units>
             </State>
             <State id="batterySoH">
                 <ValueType>Number</ValueType>
                 <TriggerLabel>Battery State of Health Changed</TriggerLabel>
-                <ControlPageLabel>Battery SoH</ControlPageLabel>
+                <ControlPageLabel>State of Health</ControlPageLabel>
                 <Units>%</Units>
             </State>
-            <State id="loadPower">
+            <State id="batteryVoltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Voltage Changed</TriggerLabel>
+                <ControlPageLabel>Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="batteryCurrent">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Current Changed</TriggerLabel>
+                <ControlPageLabel>Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="batteryMinCellVoltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Min Cell Voltage Changed</TriggerLabel>
+                <ControlPageLabel>Min Cell Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="batteryMaxCellVoltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Max Cell Voltage Changed</TriggerLabel>
+                <ControlPageLabel>Max Cell Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="batteryMinCellTemp">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Min Cell Temperature Changed</TriggerLabel>
+                <ControlPageLabel>Min Cell Temperature</ControlPageLabel>
+                <Units>°C</Units>
+            </State>
+            <State id="batteryMaxCellTemp">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Max Cell Temperature Changed</TriggerLabel>
+                <ControlPageLabel>Max Cell Temperature</ControlPageLabel>
+                <Units>°C</Units>
+            </State>
+            <State id="batteryCapacity">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Rated Capacity Changed</TriggerLabel>
+                <ControlPageLabel>Rated Capacity</ControlPageLabel>
+                <Units>kWh</Units>
+            </State>
+            <State id="batteryChargeEnergy">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Lifetime Charge Energy Changed</TriggerLabel>
+                <ControlPageLabel>Lifetime Charge Energy</ControlPageLabel>
+                <Units>kWh</Units>
+            </State>
+            <State id="batteryDischargeEnergy">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Battery Lifetime Discharge Energy Changed</TriggerLabel>
+                <ControlPageLabel>Lifetime Discharge Energy</ControlPageLabel>
+                <Units>kWh</Units>
+            </State>
+        </States>
+        <UiDisplayStateId>batterySoC</UiDisplayStateId>
+    </Device>
+
+    <Device type="custom" id="gridDevice">
+        <Name>AlphaESS Grid</Name>
+        <ConfigUI>
+            <Field id="systemDevice" type="menu">
+                <Label>AlphaESS Inverter:</Label>
+                <Description>Which inverter this grid device belongs to</Description>
+                <List class="self" method="get_inverters" dynamicReload="true"/>
+            </Field>
+        </ConfigUI>
+        <States>
+            <State id="gridPower">
                 <ValueType>Integer</ValueType>
-                <TriggerLabel>House Load Power Changed</TriggerLabel>
-                <ControlPageLabel>House Load</ControlPageLabel>
+                <TriggerLabel>Grid Power Changed</TriggerLabel>
+                <ControlPageLabel>Grid Power</ControlPageLabel>
                 <Units>W</Units>
+            </State>
+            <State id="gridVoltage">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid Voltage Changed</TriggerLabel>
+                <ControlPageLabel>Voltage</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="gridCurrent">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid Current Changed</TriggerLabel>
+                <ControlPageLabel>Current</ControlPageLabel>
+                <Units>A</Units>
+            </State>
+            <State id="gridFrequency">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid Frequency Changed</TriggerLabel>
+                <ControlPageLabel>Frequency</ControlPageLabel>
+                <Units>Hz</Units>
             </State>
             <State id="lifetimeFeedToGrid">
                 <ValueType>Number</ValueType>
@@ -71,6 +299,6 @@
                 <Units>kWh</Units>
             </State>
         </States>
-        <UiDisplayStateId>batterySoC</UiDisplayStateId>
+        <UiDisplayStateId>gridPower</UiDisplayStateId>
     </Device>
 </Devices>

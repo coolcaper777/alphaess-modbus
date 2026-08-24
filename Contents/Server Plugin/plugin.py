@@ -5,6 +5,7 @@ except ImportError:
 
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -13,6 +14,12 @@ from typing import Optional
 # no manual sys.path/vendoring needed.
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
+
+# Indigo's placeholder name for a device that hasn't been renamed yet
+# (e.g. "new device", "new device 2" if there's a name collision) - child
+# device creation is deferred while this still matches, same as MyAir, to
+# avoid permanently naming children after the placeholder.
+NEW_DEVICE_NAME_RE = re.compile(r"^new device(\s+\d+)?$", re.IGNORECASE)
 
 # AlphaESS inverters only ever answer on Modbus unit/slave (pymodbus calls it
 # "device_id") 0x55 (85), not the Modbus default of 1 - every third-party
@@ -27,37 +34,74 @@ DEFAULT_UNIT_ID = 85
 # read via Modbus function code 3 (Read Holding Registers). "words": 2 means a
 # 32-bit value spanning two consecutive registers, high word first.
 #
-# pvPower is deliberately NOT read from the single "total_active_power_pv_meter"
-# register (address 161) - that's an optional external PV metering CT accessory,
-# and reads a flat 0 on installations (like this one) that don't have it wired
-# up, even with real solar production happening. The real source is
-# PV_STRING_POWER_ADDRESSES below, summed.
+# Grouped by which of the three child devices (Grid/Battery/Solar) each value
+# is written to - see _poll_inverter. Every entry here falls inside one of the
+# three REGISTER_CLUSTERS ranges below; nothing here costs an extra Modbus
+# round trip over what the plugin already reads.
 REGISTERS = {
-    "gridPower": {"address": 33, "words": 2, "signed": True, "decimals": 0},
-    "batteryPower": {"address": 294, "words": 1, "signed": True, "decimals": 0},
-    "batterySoC": {"address": 258, "words": 1, "signed": False, "decimals": 1},
-    "batterySoH": {"address": 283, "words": 1, "signed": False, "decimals": 1},
+    # Grid (cluster: 16-34)
     "lifetimeFeedToGrid": {"address": 16, "words": 2, "signed": False, "decimals": 2},
     "lifetimeConsumedFromGrid": {"address": 18, "words": 2, "signed": False, "decimals": 2},
+    "gridVoltage": {"address": 20, "words": 1, "signed": False, "decimals": 1},
+    "gridCurrent": {"address": 23, "words": 1, "signed": True, "decimals": 1},
+    "gridFrequency": {"address": 26, "words": 1, "signed": False, "decimals": 1},
+    "gridPower": {"address": 33, "words": 2, "signed": True, "decimals": 0},
+
+    # Battery (cluster: 256-294)
+    "batteryVoltage": {"address": 256, "words": 1, "signed": False, "decimals": 1},
+    "batteryCurrent": {"address": 257, "words": 1, "signed": True, "decimals": 1},
+    "batterySoC": {"address": 258, "words": 1, "signed": False, "decimals": 1},
+    "batteryMinCellVoltage": {"address": 263, "words": 1, "signed": False, "decimals": 3},
+    "batteryMaxCellVoltage": {"address": 266, "words": 1, "signed": False, "decimals": 3},
+    "batteryMinCellTemp": {"address": 269, "words": 1, "signed": True, "decimals": 1},
+    "batteryMaxCellTemp": {"address": 272, "words": 1, "signed": True, "decimals": 1},
+    "batteryCapacity": {"address": 281, "words": 1, "signed": False, "decimals": 1},
+    "batterySoH": {"address": 283, "words": 1, "signed": False, "decimals": 1},
+    "batteryChargeEnergy": {"address": 288, "words": 2, "signed": False, "decimals": 1},
+    "batteryDischargeEnergy": {"address": 290, "words": 2, "signed": False, "decimals": 1},
+    "batteryPower": {"address": 294, "words": 1, "signed": True, "decimals": 0},
+
+    # Solar / PV strings + inverter health (cluster: 1053-1077). Unused
+    # strings simply read 0 - no special-casing needed for fewer than 6
+    # strings wired up. registers.json lists pv3Power's type as a single
+    # 16-bit "register", but the surrounding address spacing (pv4Voltage
+    # starts 2 registers after pv3Power, same gap as every other string)
+    # shows it's actually 2 words like the rest - treated as such here.
+    "pv1Voltage": {"address": 1053, "words": 1, "signed": False, "decimals": 1},
+    "pv1Current": {"address": 1054, "words": 1, "signed": False, "decimals": 1},
+    "pv1Power": {"address": 1055, "words": 2, "signed": False, "decimals": 0},
+    "pv2Voltage": {"address": 1057, "words": 1, "signed": False, "decimals": 1},
+    "pv2Current": {"address": 1058, "words": 1, "signed": False, "decimals": 1},
+    "pv2Power": {"address": 1059, "words": 2, "signed": False, "decimals": 0},
+    "pv3Voltage": {"address": 1061, "words": 1, "signed": False, "decimals": 1},
+    "pv3Current": {"address": 1062, "words": 1, "signed": False, "decimals": 1},
+    "pv3Power": {"address": 1063, "words": 2, "signed": False, "decimals": 0},
+    "pv4Voltage": {"address": 1065, "words": 1, "signed": False, "decimals": 1},
+    "pv4Current": {"address": 1066, "words": 1, "signed": False, "decimals": 1},
+    "pv4Power": {"address": 1067, "words": 2, "signed": False, "decimals": 0},
+    "pv5Voltage": {"address": 1069, "words": 1, "signed": False, "decimals": 1},
+    "pv5Current": {"address": 1070, "words": 1, "signed": False, "decimals": 1},
+    "pv5Power": {"address": 1071, "words": 2, "signed": False, "decimals": 0},
+    "pv6Voltage": {"address": 1073, "words": 1, "signed": False, "decimals": 1},
+    "pv6Current": {"address": 1074, "words": 1, "signed": False, "decimals": 1},
+    "pv6Power": {"address": 1075, "words": 2, "signed": False, "decimals": 0},
+    "invTemperature": {"address": 1077, "words": 1, "signed": False, "decimals": 1},
 }
 
-# The inverter's own per-MPPT-string PV readings: voltage, current, power (2
-# words) per string, 4 registers each, 6 strings back to back with no gaps -
-# unused strings simply read 0. registers.json lists pv3_power's type as a
-# single 16-bit "register", but the surrounding address spacing (pv4_voltage
-# starts 2 registers after pv3_power, same as every other string) shows it's
-# actually 2 words like the rest - treated as such here.
-INVERTER_PV_BLOCK_START = 1053  # pv1_voltage
-INVERTER_PV_BLOCK_COUNT = 24    # through pv6_power inclusive (6 strings x 4 registers)
-PV_STRING_POWER_ADDRESSES = [1055, 1059, 1063, 1067, 1071, 1075]
+PV_STRINGS = range(1, 7)
+SOLAR_CLUSTER_START = 1053
+BATTERY_CLUSTER_START = 256
+GRID_CLUSTER_START = 16
 
-# Batched read ranges covering every address in REGISTERS plus the PV string
-# block above, so a poll takes 3 Modbus round trips instead of 12+. Each tuple
-# is (start_address, count).
+# Batched read ranges covering every address in REGISTERS, so a poll takes 3
+# Modbus round trips instead of 20+. Each tuple is (start_address, count).
+# Each cluster's success/failure is tracked independently in _poll_inverter -
+# a failure on one (e.g. the battery cluster, on hardware with no battery)
+# doesn't prevent the other two from updating their own device.
 REGISTER_CLUSTERS = [
-    (16, 19),   # covers lifetimeFeedToGrid (16-17), lifetimeConsumedFromGrid (18-19), gridPower (33-34)
-    (INVERTER_PV_BLOCK_START, INVERTER_PV_BLOCK_COUNT),
-    (258, 37),  # covers batterySoC (258), batterySoH (283), batteryPower (294)
+    (GRID_CLUSTER_START, 19),    # 16-34: lifetime energy, per-phase grid readings, gridPower
+    (SOLAR_CLUSTER_START, 25),   # 1053-1077: 6 PV strings + inverter temperature
+    (BATTERY_CLUSTER_START, 39),  # 256-294: battery voltage/current/cells/energy/power
 ]
 
 # Served at http://<this-mac>:8176/message/com.coolcaper.alphaessmodbus/dashboard
@@ -331,6 +375,47 @@ class Plugin(indigo.PluginBase):
         self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
         self.logger.info(f"Debug logging {'enabled' if self.debug else 'disabled'}")
 
+    def validateDeviceConfigUi(self, valuesDict: indigo.Dict, typeId: str, devId: int) -> tuple:
+        """Validate the New/Edit Device dialog before it's allowed to save.
+
+        Args:
+            valuesDict (indigo.Dict): The dialog's current field values.
+            typeId (str): The device type being configured.
+            devId (int): The device's ID (0 for a device being newly created).
+
+        Returns:
+            tuple: ``(True, valuesDict)`` if valid, or
+                ``(False, valuesDict, errorsDict)`` with per-field error messages
+                if not.
+        """
+        errors_dict = indigo.Dict()
+        if typeId == "inverter":
+            address = valuesDict.get("address", "").strip()
+            if not address:
+                errors_dict["address"] = "Inverter IP address is required."
+            elif " " in address:
+                errors_dict["address"] = "IP address must not contain spaces."
+        elif typeId in ("solarDevice", "batteryDevice", "gridDevice"):
+            if not valuesDict.get("systemDevice", ""):
+                errors_dict["systemDevice"] = "Please select the AlphaESS Inverter this device belongs to."
+        if errors_dict:
+            return (False, valuesDict, errors_dict)
+        return (True, valuesDict)
+
+    def get_inverters(self, filter: str = "", valuesDict: Optional[indigo.Dict] = None, typeId: str = "", targetId: int = 0) -> list:
+        """Dynamic menu list for the Solar/Battery/Grid device's 'AlphaESS Inverter' picker.
+
+        Args:
+            filter (str): Indigo's dynamic-list filter string (unused).
+            valuesDict (Optional[indigo.Dict]): The dialog's current field values (unused).
+            typeId (str): The device type being configured (unused).
+            targetId (int): The device's ID (unused).
+
+        Returns:
+            list: ``(device_id, device_name)`` tuples for every AlphaESS Inverter device.
+        """
+        return [(dev.id, dev.name) for dev in indigo.devices.iter("self.inverter")]
+
     def runConcurrentThread(self) -> None:
         """Indigo's polling loop entry point.
 
@@ -384,15 +469,73 @@ class Plugin(indigo.PluginBase):
         self.logger.debug(f"deviceStopComm: {dev.name}")
         self._next_poll_at.pop(dev.id, None)
 
-    def _poll_inverter(self, dev: indigo.Device) -> None:
-        """Read one poll's worth of Modbus registers from an inverter and update its states.
+    def _get_or_create_child(self, parent_dev: indigo.Device, type_id: str, label: str) -> indigo.Device:
+        """Return a parent inverter's Solar/Battery/Grid child device, creating it if missing.
 
         Args:
-            dev (indigo.Device): The inverter device to poll.
+            parent_dev (indigo.Device): The AlphaESS Inverter device.
+            type_id (str): The child device type ID (``solarDevice``/``batteryDevice``/``gridDevice``).
+            label (str): Human-readable label used for the auto-generated name and log line.
+
+        Returns:
+            indigo.Device: The existing or newly-created child device.
+        """
+        for d in indigo.devices.iter(f"self.{type_id}"):
+            if d.pluginProps.get("systemDevice") == str(parent_dev.id):
+                return d
+        new_dev = indigo.device.create(
+            protocol=indigo.kProtocol.Plugin,
+            deviceTypeId=type_id,
+            name=f"{parent_dev.name} - {label}",
+            pluginId=self.pluginId,
+            props={"systemDevice": str(parent_dev.id)},
+        )
+        self.logger.info(f"Created {label.lower()} device: {new_dev.name}")
+        return new_dev
+
+    def _find_child(self, parent_id: int, type_id: str) -> Optional[indigo.Device]:
+        """Look up (without creating) a parent inverter's Solar/Battery/Grid child device.
+
+        Args:
+            parent_id (int): The parent AlphaESS Inverter device's ID.
+            type_id (str): The child device type ID (``solarDevice``/``batteryDevice``/``gridDevice``).
+
+        Returns:
+            Optional[indigo.Device]: The child device, or None if it doesn't exist (yet).
+        """
+        return next(
+            (d for d in indigo.devices.iter(f"self.{type_id}") if d.pluginProps.get("systemDevice") == str(parent_id)),
+            None,
+        )
+
+    def _set_children_error(self, dev: indigo.Device, message: str) -> None:
+        """Set an Indigo error state on every already-existing child device of an inverter.
+
+        Used for failures that happen before any register cluster is even
+        attempted (bad config, connect failure) - existing children shouldn't
+        be left showing stale "last good" data with no error indicator.
+        Deliberately doesn't create children that don't exist yet.
+
+        Args:
+            dev (indigo.Device): The parent AlphaESS Inverter device.
+            message (str): The error message to set on each child.
+        """
+        for type_id in ("solarDevice", "batteryDevice", "gridDevice"):
+            child = self._find_child(dev.id, type_id)
+            if child:
+                child.setErrorStateOnServer(message)
+
+    def _poll_inverter(self, dev: indigo.Device) -> None:
+        """Read one poll's worth of Modbus registers from an inverter and update its (and its
+        Solar/Battery/Grid children's) states.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device to poll.
         """
         address = dev.pluginProps.get("address", "")
         if not address:
             dev.setErrorStateOnServer("No IP address configured")
+            self._set_children_error(dev, "No IP address configured")
             return
         try:
             port = int(dev.pluginProps.get("port", 502))
@@ -402,7 +545,9 @@ class Plugin(indigo.PluginBase):
             # enforce numeric-only input, so a cleared/typo'd field would
             # otherwise raise here unguarded, before the try block below that
             # actually sets an error state on failure.
-            dev.setErrorStateOnServer("Invalid Port or Unit ID - must be a number")
+            message = "Invalid Port or Unit ID - must be a number"
+            dev.setErrorStateOnServer(message)
+            self._set_children_error(dev, message)
             self.logger.error(
                 f"{dev.name}: Port/Unit ID must be numeric "
                 f"(got port={dev.pluginProps.get('port')!r}, unitId={dev.pluginProps.get('unitId')!r})"
@@ -411,17 +556,28 @@ class Plugin(indigo.PluginBase):
 
         client = ModbusTcpClient(address, port=port, timeout=5)
         if not client.connect():
-            dev.setErrorStateOnServer("Connection failed")
+            message = "Connection failed"
+            dev.setErrorStateOnServer(message)
+            self._set_children_error(dev, message)
             self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
             return
 
         try:
             values = {}
             cluster_registers = {}
+            cluster_errors = {}
             for start, count in REGISTER_CLUSTERS:
-                result = client.read_holding_registers(start, count=count, device_id=unit_id)
-                if result.isError():
-                    raise ModbusException(f"error reading registers {start}-{start + count - 1}: {result}")
+                try:
+                    result = client.read_holding_registers(start, count=count, device_id=unit_id)
+                    if result.isError():
+                        raise ModbusException(f"error reading registers {start}-{start + count - 1}: {result}")
+                except ModbusException as e:
+                    # Isolated per cluster rather than aborting the whole poll -
+                    # e.g. a battery-less installation refusing the battery
+                    # cluster shouldn't also stop Grid/Solar from updating.
+                    cluster_errors[start] = str(e)
+                    self.logger.error(f"{dev.name}: {e}")
+                    continue
                 cluster_registers[start] = result.registers
                 for name, spec in REGISTERS.items():
                     if start <= spec["address"] and spec["address"] + spec["words"] <= start + count:
@@ -429,50 +585,103 @@ class Plugin(indigo.PluginBase):
                         regs = result.registers[offset: offset + spec["words"]]
                         values[name] = _decode_value(regs, spec["signed"], spec["decimals"])
                         self.logger.debug(f"{dev.name}: {name} = {values[name]} (raw {regs})")
-
-            pv_block = cluster_registers[INVERTER_PV_BLOCK_START]
-            pv_power = 0
-            for addr in PV_STRING_POWER_ADDRESSES:
-                offset = addr - INVERTER_PV_BLOCK_START
-                pv_power += _decode_value(pv_block[offset:offset + 2], signed=False, decimals=0)
-            self.logger.debug(f"{dev.name}: pvPower = {pv_power} (summed {len(PV_STRING_POWER_ADDRESSES)} PV strings)")
-        except ModbusException as e:
-            dev.setErrorStateOnServer("Modbus read error")
-            self.logger.error(f"{dev.name}: {e}")
-            return
         except Exception:
             # Anything not already modeled above (e.g. a decode bug) would
             # otherwise only get logged by runConcurrentThread's outer
             # try/except - leaving the device looking fine (green) in
             # Indigo's device list while it silently stops updating.
-            dev.setErrorStateOnServer("Unexpected error - see plugin log")
+            message = "Unexpected error - see plugin log"
+            dev.setErrorStateOnServer(message)
+            self._set_children_error(dev, message)
             self.logger.exception(f"{dev.name}: unexpected error while polling")
             return
         finally:
             client.close()
 
-        grid_power = values["gridPower"]
-        battery_power = values["batteryPower"]
-        # Matches the Hillview integration's "house load" formula: PV +
-        # battery output + grid import all flow into the house, whichever
-        # combination is currently supplying it.
-        load_power = pv_power + battery_power + grid_power
+        grid_ok = GRID_CLUSTER_START in cluster_registers
+        battery_ok = BATTERY_CLUSTER_START in cluster_registers
+        solar_ok = SOLAR_CLUSTER_START in cluster_registers
+
+        if NEW_DEVICE_NAME_RE.match(dev.name.strip()):
+            # Skip creating/updating child devices while this still has
+            # Indigo's placeholder name - they'd get named after it
+            # permanently. The next poll (after it's renamed) picks this back up.
+            self.logger.debug(f"Deferring child device creation for \"{dev.name}\" until it's renamed")
+            return
+
+        solar_dev = self._get_or_create_child(dev, "solarDevice", "Solar")
+        battery_dev = self._get_or_create_child(dev, "batteryDevice", "Battery")
+        grid_dev = self._get_or_create_child(dev, "gridDevice", "Grid")
 
         # decimalPlaces controls Indigo's own display formatting - plain
         # round() doesn't help here, since Indigo shows the raw double's full
         # binary expansion (e.g. "90.40000000000001") regardless of how
         # cleanly the Python float was rounded before being sent.
-        dev.updateStatesOnServer([
-            {"key": "pvPower", "value": int(pv_power)},
-            {"key": "gridPower", "value": int(grid_power)},
-            {"key": "batteryPower", "value": int(battery_power)},
-            {"key": "batterySoC", "value": values["batterySoC"], "decimalPlaces": 2},
-            {"key": "batterySoH", "value": values["batterySoH"], "decimalPlaces": 2},
-            {"key": "loadPower", "value": int(load_power)},
-            {"key": "lifetimeFeedToGrid", "value": values["lifetimeFeedToGrid"], "decimalPlaces": 2},
-            {"key": "lifetimeConsumedFromGrid", "value": values["lifetimeConsumedFromGrid"], "decimalPlaces": 2},
-        ])
-        dev.setErrorStateOnServer(None)
+        if grid_ok:
+            grid_dev.updateStatesOnServer([
+                {"key": "gridPower", "value": int(values["gridPower"])},
+                {"key": "gridVoltage", "value": values["gridVoltage"], "decimalPlaces": 1},
+                {"key": "gridCurrent", "value": values["gridCurrent"], "decimalPlaces": 1},
+                {"key": "gridFrequency", "value": values["gridFrequency"], "decimalPlaces": 1},
+                {"key": "lifetimeFeedToGrid", "value": values["lifetimeFeedToGrid"], "decimalPlaces": 2},
+                {"key": "lifetimeConsumedFromGrid", "value": values["lifetimeConsumedFromGrid"], "decimalPlaces": 2},
+            ])
+            grid_dev.setErrorStateOnServer(None)
+        else:
+            grid_dev.setErrorStateOnServer(cluster_errors.get(GRID_CLUSTER_START, "Modbus read error"))
+
+        if battery_ok:
+            battery_dev.updateStatesOnServer([
+                {"key": "batteryPower", "value": int(values["batteryPower"])},
+                {"key": "batterySoC", "value": values["batterySoC"], "decimalPlaces": 2},
+                {"key": "batterySoH", "value": values["batterySoH"], "decimalPlaces": 2},
+                {"key": "batteryVoltage", "value": values["batteryVoltage"], "decimalPlaces": 1},
+                {"key": "batteryCurrent", "value": values["batteryCurrent"], "decimalPlaces": 1},
+                {"key": "batteryMinCellVoltage", "value": values["batteryMinCellVoltage"], "decimalPlaces": 3},
+                {"key": "batteryMaxCellVoltage", "value": values["batteryMaxCellVoltage"], "decimalPlaces": 3},
+                {"key": "batteryMinCellTemp", "value": values["batteryMinCellTemp"], "decimalPlaces": 1},
+                {"key": "batteryMaxCellTemp", "value": values["batteryMaxCellTemp"], "decimalPlaces": 1},
+                {"key": "batteryCapacity", "value": values["batteryCapacity"], "decimalPlaces": 1},
+                {"key": "batteryChargeEnergy", "value": values["batteryChargeEnergy"], "decimalPlaces": 1},
+                {"key": "batteryDischargeEnergy", "value": values["batteryDischargeEnergy"], "decimalPlaces": 1},
+            ])
+            battery_dev.setErrorStateOnServer(None)
+        else:
+            battery_dev.setErrorStateOnServer(cluster_errors.get(BATTERY_CLUSTER_START, "Modbus read error"))
+
+        pv_power = None
+        if solar_ok:
+            pv_power = sum(values[f"pv{n}Power"] for n in PV_STRINGS)
+            solar_states = [{"key": "pvPower", "value": int(pv_power)}]
+            for n in PV_STRINGS:
+                solar_states.append({"key": f"pv{n}Voltage", "value": values[f"pv{n}Voltage"], "decimalPlaces": 1})
+                solar_states.append({"key": f"pv{n}Current", "value": values[f"pv{n}Current"], "decimalPlaces": 1})
+                solar_states.append({"key": f"pv{n}Power", "value": int(values[f"pv{n}Power"])})
+            solar_dev.updateStatesOnServer(solar_states)
+            solar_dev.setErrorStateOnServer(None)
+            self.logger.debug(f"{dev.name}: pvPower = {pv_power} (summed 6 PV strings)")
+        else:
+            solar_dev.setErrorStateOnServer(cluster_errors.get(SOLAR_CLUSTER_START, "Modbus read error"))
+
+        inverter_states = []
+        if solar_ok:
+            inverter_states.append({"key": "invTemperature", "value": values["invTemperature"], "decimalPlaces": 1})
+        if grid_ok and battery_ok and solar_ok:
+            # Matches the Hillview integration's "house load" formula: PV +
+            # battery output + grid import all flow into the house, whichever
+            # combination is currently supplying it. Skipped entirely (rather
+            # than computed from a stale/partial mix) if any one of the three
+            # clusters failed this cycle.
+            load_power = pv_power + values["batteryPower"] + values["gridPower"]
+            inverter_states.append({"key": "loadPower", "value": int(load_power)})
+        if inverter_states:
+            dev.updateStatesOnServer(inverter_states)
+
+        if grid_ok and battery_ok and solar_ok:
+            dev.setErrorStateOnServer(None)
+        else:
+            missing = [name for name, ok in (("solar", solar_ok), ("battery", battery_ok), ("grid", grid_ok)) if not ok]
+            dev.setErrorStateOnServer(f"Partial read this cycle - {'/'.join(missing)} unavailable (see that device)")
 
     def dashboard(self, action, dev=None, caller_waiting_for_result=None):
         """Serve the live AlphaESS dashboard page.
@@ -541,20 +750,29 @@ class Plugin(indigo.PluginBase):
                 reply["content"] = json.dumps({"ok": False, "error": "No configured AlphaESS Inverter device found", "devices": device_list})
                 return reply
 
+            # pvPower/gridPower/batteryPower/etc. live on the Solar/Battery/Grid
+            # child devices, not on the parent inverter device itself - the
+            # dashboard's own JS is unchanged, it just gets its numbers
+            # gathered from four devices instead of one now.
+            solar = self._find_child(target.id, "solarDevice")
+            battery = self._find_child(target.id, "batteryDevice")
+            grid = self._find_child(target.id, "gridDevice")
+            error_state = target.errorState or (solar and solar.errorState) or (battery and battery.errorState) or (grid and grid.errorState) or None
+
             payload = {
                 "ok": True,
                 "deviceId": target.id,
                 "deviceName": target.name,
                 "devices": device_list,
-                "errorState": target.errorState or None,
-                "pvPower": target.states.get("pvPower", 0),
-                "gridPower": target.states.get("gridPower", 0),
-                "batteryPower": target.states.get("batteryPower", 0),
-                "batterySoC": target.states.get("batterySoC", 0),
-                "batterySoH": target.states.get("batterySoH", 0),
+                "errorState": error_state,
+                "pvPower": solar.states.get("pvPower", 0) if solar else 0,
+                "gridPower": grid.states.get("gridPower", 0) if grid else 0,
+                "batteryPower": battery.states.get("batteryPower", 0) if battery else 0,
+                "batterySoC": battery.states.get("batterySoC", 0) if battery else 0,
+                "batterySoH": battery.states.get("batterySoH", 0) if battery else 0,
                 "loadPower": target.states.get("loadPower", 0),
-                "lifetimeFeedToGrid": target.states.get("lifetimeFeedToGrid", 0),
-                "lifetimeConsumedFromGrid": target.states.get("lifetimeConsumedFromGrid", 0),
+                "lifetimeFeedToGrid": grid.states.get("lifetimeFeedToGrid", 0) if grid else 0,
+                "lifetimeConsumedFromGrid": grid.states.get("lifetimeConsumedFromGrid", 0) if grid else 0,
             }
             reply["content"] = json.dumps(payload)
             return reply
