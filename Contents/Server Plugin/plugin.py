@@ -28,6 +28,21 @@ NEW_DEVICE_NAME_RE = re.compile(r"^new device(\s+\d+)?$", re.IGNORECASE)
 # device ConfigUI field rather than hardcoded, in case a future model differs.
 DEFAULT_UNIT_ID = 85
 
+# runConcurrentThread ticks every 5 seconds (see below), so anything faster
+# than that wouldn't actually poll any sooner - just enforced as a floor.
+MIN_POLL_INTERVAL = 5
+DEFAULT_POLL_INTERVAL = 30
+
+# Inverter ConfigUI fields worth an Indigo Event Log confirmation line when
+# edited on an existing device (see deviceUpdated) - keyed by pluginProps id,
+# valued by the human-readable label to log it under.
+INVERTER_CONFIG_FIELD_LABELS = {
+    "address": "Inverter IP Address",
+    "port": "Modbus TCP Port",
+    "unitId": "Modbus Unit/Slave ID",
+    "pollInterval": "Poll Interval",
+}
+
 # Register addresses/types pulled from SorX14/alphaess_modbus (MIT-licensed)
 # registers.json, cross-checked against AlphaESS's own dispatch register
 # addresses documented on https://projects.hillviewlodge.ie/alphaess/. All are
@@ -39,18 +54,42 @@ DEFAULT_UNIT_ID = 85
 # three REGISTER_CLUSTERS ranges below; nothing here costs an extra Modbus
 # round trip over what the plugin already reads.
 REGISTERS = {
-    # Grid (cluster: 16-34)
+    # Grid (cluster: 16-34). Phase B/C readings simply read 0 on a
+    # single-phase installation - same "unused reads 0" pattern as the PV
+    # strings, so no special-casing needed there either.
     "lifetimeFeedToGrid": {"address": 16, "words": 2, "signed": False, "decimals": 2},
     "lifetimeConsumedFromGrid": {"address": 18, "words": 2, "signed": False, "decimals": 2},
-    "gridVoltage": {"address": 20, "words": 1, "signed": False, "decimals": 1},
-    "gridCurrent": {"address": 23, "words": 1, "signed": True, "decimals": 1},
-    "gridFrequency": {"address": 26, "words": 1, "signed": False, "decimals": 1},
+    # senalse/ha-alphaess-modbus's register_map.md documents these as
+    # scale x1 by default (raw register value *is* the volt reading) - only
+    # the SMILE-B3/SMILE-B3-PLUS model variant uses x0.1 instead. This
+    # plugin previously used decimals:1 (x0.1) unconditionally; switched to
+    # the documented default since invTemperature (which has the same
+    # SMILE-B3 exception, just x0.01 instead of x0.1) has never shown a
+    # wrong-looking value on this install, implying non-SMILE-B3 hardware.
+    "gridVoltage": {"address": 20, "words": 1, "signed": False, "decimals": 0},
+    "gridVoltageB": {"address": 21, "words": 1, "signed": False, "decimals": 0},
+    "gridVoltageC": {"address": 22, "words": 1, "signed": False, "decimals": 0},
+    # Grid current (23-25) deliberately NOT read - neither Hillview's
+    # verified HA config nor senalse/ha-alphaess-modbus exposes it, unlike
+    # every other register in this cluster, so there's no confirmed source
+    # for its scale/reliability. User's call: stick to values we can be
+    # certain about rather than guess. Current is derivable from
+    # gridPower/gridVoltage anyway (I = P/V) if ever needed.
+    "gridPowerA": {"address": 27, "words": 2, "signed": True, "decimals": 0},
+    "gridPowerB": {"address": 29, "words": 2, "signed": True, "decimals": 0},
+    "gridPowerC": {"address": 31, "words": 2, "signed": True, "decimals": 0},
     "gridPower": {"address": 33, "words": 2, "signed": True, "decimals": 0},
 
-    # Battery (cluster: 256-294)
+    # Battery (cluster: 256-295)
     "batteryVoltage": {"address": 256, "words": 1, "signed": False, "decimals": 1},
     "batteryCurrent": {"address": 257, "words": 1, "signed": True, "decimals": 1},
     "batterySoC": {"address": 258, "words": 1, "signed": False, "decimals": 1},
+    # Undocumented in every AlphaESS Modbus project checked while this
+    # register sat unused - EXCEPT senalse/ha-alphaess-modbus's own
+    # "AlphaESS Battery Full" template, confirmed working against the
+    # user's real hardware: battery_status == 1 means the battery is full.
+    # No other codes are documented, so nothing else is inferred from it.
+    "batteryStatus": {"address": 259, "words": 1, "signed": False, "decimals": 0},
     "batteryMinCellVoltage": {"address": 263, "words": 1, "signed": False, "decimals": 3},
     "batteryMaxCellVoltage": {"address": 266, "words": 1, "signed": False, "decimals": 3},
     "batteryMinCellTemp": {"address": 269, "words": 1, "signed": True, "decimals": 1},
@@ -60,13 +99,27 @@ REGISTERS = {
     "batteryChargeEnergy": {"address": 288, "words": 2, "signed": False, "decimals": 1},
     "batteryDischargeEnergy": {"address": 290, "words": 2, "signed": False, "decimals": 1},
     "batteryPower": {"address": 294, "words": 1, "signed": True, "decimals": 0},
+    "batteryRemainingTime": {"address": 295, "words": 1, "signed": False, "decimals": 0},
 
-    # Solar / PV strings + inverter health (cluster: 1053-1077). Unused
+    # Solar / PV strings + inverter health (cluster: 1052-1088). Unused
     # strings simply read 0 - no special-casing needed for fewer than 6
     # strings wired up. registers.json lists pv3Power's type as a single
     # 16-bit "register", but the surrounding address spacing (pv4Voltage
     # starts 2 registers after pv3Power, same gap as every other string)
     # shows it's actually 2 words like the rest - treated as such here.
+    #
+    # gridFrequency lives here, NOT in the grid/meter cluster above, despite
+    # the name - it's read from the inverter's own frequency sensor
+    # (address 1052/0x041C), not the grid CT meter's register 26/0x001A
+    # that registers.json documents under the "frequency_grid" name. Switched
+    # after cross-checking against senalse/ha-alphaess-modbus's YAML, which
+    # the user confirmed is verified working on their own hardware: that
+    # project's "AlphaESS Inverter Grid Frequency" sensor reads address 1052
+    # exclusively and never references register 26 at all. Register 26 was
+    # also the source of the original 10x display bug (decimals:1 there
+    # instead of :2) - reading a different, actually-documented register
+    # instead of just patching that one's scale removes the guesswork.
+    "gridFrequency": {"address": 1052, "words": 1, "signed": False, "decimals": 2},
     "pv1Voltage": {"address": 1053, "words": 1, "signed": False, "decimals": 1},
     "pv1Current": {"address": 1054, "words": 1, "signed": False, "decimals": 1},
     "pv1Power": {"address": 1055, "words": 2, "signed": False, "decimals": 0},
@@ -86,22 +139,57 @@ REGISTERS = {
     "pv6Current": {"address": 1074, "words": 1, "signed": False, "decimals": 1},
     "pv6Power": {"address": 1075, "words": 2, "signed": False, "decimals": 0},
     "invTemperature": {"address": 1077, "words": 1, "signed": False, "decimals": 1},
+    # 1078-1087 (inverter warning/fault flags, lifetime PV energy) fall in
+    # this same documented, contiguous range but aren't decoded - nothing
+    # currently needs them; reading past them costs nothing extra since the
+    # cluster already has to span up to invWorkMode at 1088.
+    "invWorkMode": {"address": 1088, "words": 1, "signed": False, "decimals": 0},
 }
 
+# inverter_work_mode's documented meaning beyond these two codes is
+# "model-specific" (per both the Hillview register docs and the
+# senalse/ha-alphaess-modbus project) - anything else is shown as a raw
+# fallback rather than guessed.
+INVERTER_WORK_MODE_LABELS = {1: "Normal", 2: "Bypass/EPS"}
+
 PV_STRINGS = range(1, 7)
-SOLAR_CLUSTER_START = 1053
+# Not 1053 - widened by 1 register to also cover gridFrequency at 1052 (see
+# the REGISTERS comment above for why that value lives in this cluster).
+SOLAR_CLUSTER_START = 1052
 BATTERY_CLUSTER_START = 256
 GRID_CLUSTER_START = 16
+# Far from every other cluster (system_time_year_month/day_hour/minute_second),
+# so it's its own small extra round trip rather than folded into an existing
+# cluster's range.
+SYSTEM_TIME_CLUSTER_START = 1856
 
-# Batched read ranges covering every address in REGISTERS, so a poll takes 3
+# Every state each child device exposes, in display order - used by
+# dashboard_data to hand the dashboard page every value it has (not just the
+# handful summarized on the four top tiles), grouped per device the same way
+# Devices.xml groups them.
+INVERTER_STATE_KEYS = ["loadPower", "invTemperature", "invWorkMode", "systemTime"]
+SOLAR_STATE_KEYS = ["pvPower"] + [f"pv{n}{suffix}" for n in PV_STRINGS for suffix in ("Voltage", "Current", "Power")]
+BATTERY_STATE_KEYS = [
+    "batteryPower", "batterySoC", "batterySoH", "batteryVoltage", "batteryCurrent",
+    "batteryMinCellVoltage", "batteryMaxCellVoltage", "batteryMinCellTemp", "batteryMaxCellTemp",
+    "batteryCapacity", "batteryChargeEnergy", "batteryDischargeEnergy", "batteryFull", "batteryRemainingTime",
+]
+GRID_STATE_KEYS = [
+    "gridPower", "gridPowerA", "gridPowerB", "gridPowerC",
+    "gridVoltage", "gridVoltageB", "gridVoltageC",
+    "gridFrequency", "lifetimeFeedToGrid", "lifetimeConsumedFromGrid",
+]
+
+# Batched read ranges covering every address in REGISTERS, so a poll takes 4
 # Modbus round trips instead of 20+. Each tuple is (start_address, count).
 # Each cluster's success/failure is tracked independently in _poll_inverter -
 # a failure on one (e.g. the battery cluster, on hardware with no battery)
-# doesn't prevent the other two from updating their own device.
+# doesn't prevent the others from updating their own device.
 REGISTER_CLUSTERS = [
-    (GRID_CLUSTER_START, 19),    # 16-34: lifetime energy, per-phase grid readings, gridPower
-    (SOLAR_CLUSTER_START, 25),   # 1053-1077: 6 PV strings + inverter temperature
-    (BATTERY_CLUSTER_START, 39),  # 256-294: battery voltage/current/cells/energy/power
+    (GRID_CLUSTER_START, 19),      # 16-34: lifetime energy, per-phase grid readings, gridPower
+    (SOLAR_CLUSTER_START, 37),     # 1052-1088: grid frequency, 6 PV strings, inverter temperature, work mode
+    (BATTERY_CLUSTER_START, 40),   # 256-295: battery voltage/current/status/cells/energy/power/remaining time
+    (SYSTEM_TIME_CLUSTER_START, 3),  # 1856-1858: inverter clock (year/month, day/hour, minute/second)
 ]
 
 # Served at http://<this-mac>:8176/message/com.coolcaper.alphaessmodbus/dashboard
@@ -159,9 +247,10 @@ DASHBOARD_HTML = """<!doctype html>
     padding: 24px 16px 48px;
   }
   .page { max-width: 880px; margin: 0 auto; }
-  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   h1 { font-size: 20px; font-weight: 600; margin: 0; }
   .meta { color: var(--text-muted); font-size: 13px; }
+  .headerMeta { color: var(--text-muted); font-size: 13px; margin-top: 4px; }
   select {
     font: inherit; color: var(--text-primary); background: var(--surface-1);
     border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
@@ -188,13 +277,39 @@ DASHBOARD_HTML = """<!doctype html>
   .dot-home { background: var(--series-home); }
   .value { font-size: 28px; font-weight: 600; line-height: 1.1; }
   .sub { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
+  .details {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px; margin-top: 12px;
+  }
+  .detail-card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px;
+  }
+  .detail-card h2 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
+  .rows { display: flex; flex-direction: column; }
+  .row {
+    display: flex; justify-content: space-between; gap: 12px;
+    padding: 7px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .row:last-child { border-bottom: none; }
+  .row-label { color: var(--text-secondary); }
+  .row-value { font-weight: 500; text-align: right; }
+  .strings-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .strings-table th { text-align: right; color: var(--text-muted); font-weight: 500; padding: 4px 0 8px; }
+  .strings-table th:first-child, .strings-table td:first-child { text-align: left; }
+  .strings-table td { text-align: right; padding: 6px 0; border-top: 1px solid var(--border); }
+  .empty-note { color: var(--text-muted); font-size: 13px; }
   footer { margin-top: 24px; color: var(--text-muted); font-size: 12px; }
 </style>
 </head>
 <body>
 <div class="page">
   <header>
-    <h1 id="deviceName">AlphaESS Inverter</h1>
+    <div>
+      <h1 id="deviceName">AlphaESS Inverter</h1>
+      <div class="headerMeta" id="inverterMeta"></div>
+    </div>
     <div style="display:flex; align-items:center; gap:10px;">
       <select id="deviceSelect" style="display:none;"></select>
       <span class="meta" id="lastUpdated">-</span>
@@ -224,7 +339,22 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
-  <footer>Lifetime fed to grid: <span id="lifetimeFeed">-</span> &middot; Lifetime consumed from grid: <span id="lifetimeConsumed">-</span></footer>
+  <div class="details">
+    <div class="detail-card">
+      <h2><span class="dot dot-solar" style="display:inline-block;"></span> Solar strings</h2>
+      <div id="solarDetail"><span class="empty-note">No solar device yet</span></div>
+    </div>
+    <div class="detail-card">
+      <h2><span class="dot dot-battery" style="display:inline-block;"></span> Battery detail</h2>
+      <div class="rows" id="batteryDetail"><span class="empty-note">No battery device yet</span></div>
+    </div>
+    <div class="detail-card">
+      <h2><span class="dot dot-grid" style="display:inline-block;"></span> Grid detail</h2>
+      <div class="rows" id="gridDetail"><span class="empty-note">No grid device yet</span></div>
+    </div>
+  </div>
+
+  <footer>Auto-refreshes every 5 seconds.</footer>
 </div>
 <script>
 (function () {
@@ -238,6 +368,18 @@ DASHBOARD_HTML = """<!doctype html>
     return (watts / 1000).toFixed(2) + " kW";
   }
 
+  function fmt(value, decimals, unit) {
+    return Number(value).toFixed(decimals) + " " + unit;
+  }
+
+  function formatMinutes(minutes) {
+    minutes = Math.round(minutes);
+    if (minutes < 60) return minutes + " min";
+    var hours = Math.floor(minutes / 60);
+    var rem = minutes % 60;
+    return hours + "h " + rem + "m";
+  }
+
   function setBanner(message) {
     var banner = document.getElementById("banner");
     if (message) {
@@ -248,25 +390,156 @@ DASHBOARD_HTML = """<!doctype html>
     }
   }
 
+  // Builds one label/value line (used by the Battery/Grid detail cards) purely
+  // via createElement/textContent - never innerHTML - so a device renamed to
+  // contain HTML/script content can't inject into the page.
+  function row(label, valueText) {
+    var el = document.createElement("div");
+    el.className = "row";
+    var labelEl = document.createElement("span");
+    labelEl.className = "row-label";
+    labelEl.textContent = label;
+    var valueEl = document.createElement("span");
+    valueEl.className = "row-value";
+    valueEl.textContent = valueText;
+    el.appendChild(labelEl);
+    el.appendChild(valueEl);
+    return el;
+  }
+
+  function renderBatteryDetail(battery) {
+    var container = document.getElementById("batteryDetail");
+    container.replaceChildren();
+    if (!battery) {
+      container.appendChild(Object.assign(document.createElement("span"), {className: "empty-note", textContent: "No battery device yet"}));
+      return;
+    }
+    container.appendChild(row("Voltage", fmt(battery.batteryVoltage, 1, "V")));
+    container.appendChild(row("Current", fmt(battery.batteryCurrent, 1, "A")));
+    container.appendChild(row("State of health", fmt(battery.batterySoH, 1, "%")));
+    container.appendChild(row("Min / max cell temp", fmt(battery.batteryMinCellTemp, 1, "\u00b0C") + " / " + fmt(battery.batteryMaxCellTemp, 1, "\u00b0C")));
+    container.appendChild(row("Rated capacity", fmt(battery.batteryCapacity, 1, "kWh")));
+    container.appendChild(row("Lifetime charge", fmt(battery.batteryChargeEnergy, 1, "kWh")));
+    container.appendChild(row("Lifetime discharge", fmt(battery.batteryDischargeEnergy, 1, "kWh")));
+    if (battery.batteryFull) {
+      container.appendChild(row("Status", "Full"));
+    } else if (battery.batteryRemainingTime > 0) {
+      var label = battery.batteryPower > 0 ? "Time to empty" : "Time to full";
+      container.appendChild(row(label, formatMinutes(battery.batteryRemainingTime)));
+    }
+  }
+
+  // A phase reads a flat 0 V when it isn't wired up (same "unused reads 0"
+  // convention as the PV strings) - a small noise floor avoids treating
+  // sensor jitter on an unused phase as a real 3-phase installation.
+  function isThreePhase(grid) {
+    return Math.abs(grid.gridVoltageB) > 1 || Math.abs(grid.gridVoltageC) > 1;
+  }
+
+  function renderGridDetail(grid) {
+    var container = document.getElementById("gridDetail");
+    container.replaceChildren();
+    if (!grid) {
+      container.appendChild(Object.assign(document.createElement("span"), {className: "empty-note", textContent: "No grid device yet"}));
+      return;
+    }
+    if (isThreePhase(grid)) {
+      var table = document.createElement("table");
+      table.className = "strings-table";
+      var thead = document.createElement("tr");
+      ["Phase", "Voltage", "Power"].forEach(function (h) {
+        var th = document.createElement("th");
+        th.textContent = h;
+        thead.appendChild(th);
+      });
+      table.appendChild(thead);
+      [
+        ["A", grid.gridVoltage, grid.gridPowerA],
+        ["B", grid.gridVoltageB, grid.gridPowerB],
+        ["C", grid.gridVoltageC, grid.gridPowerC],
+      ].forEach(function (phase) {
+        var tr = document.createElement("tr");
+        [phase[0], fmt(phase[1], 0, "V"), formatPower(phase[2])].forEach(function (text) {
+          var td = document.createElement("td");
+          td.textContent = text;
+          tr.appendChild(td);
+        });
+        table.appendChild(tr);
+      });
+      container.appendChild(table);
+    } else {
+      container.appendChild(row("Voltage", fmt(grid.gridVoltage, 0, "V")));
+    }
+    container.appendChild(row("Frequency", fmt(grid.gridFrequency, 2, "Hz")));
+    container.appendChild(row("Lifetime fed to grid", fmt(grid.lifetimeFeedToGrid, 2, "kWh")));
+    container.appendChild(row("Lifetime consumed from grid", fmt(grid.lifetimeConsumedFromGrid, 2, "kWh")));
+  }
+
+  function renderSolarDetail(solar) {
+    var container = document.getElementById("solarDetail");
+    container.replaceChildren();
+    if (!solar) {
+      container.appendChild(Object.assign(document.createElement("span"), {className: "empty-note", textContent: "No solar device yet"}));
+      return;
+    }
+    var table = document.createElement("table");
+    table.className = "strings-table";
+    var thead = document.createElement("tr");
+    ["String", "Voltage", "Current", "Power"].forEach(function (h) {
+      var th = document.createElement("th");
+      th.textContent = h;
+      thead.appendChild(th);
+    });
+    table.appendChild(thead);
+    for (var n = 1; n <= 6; n++) {
+      var tr = document.createElement("tr");
+      var cells = [
+        "PV" + n,
+        fmt(solar["pv" + n + "Voltage"], 1, "V"),
+        fmt(solar["pv" + n + "Current"], 1, "A"),
+        formatPower(solar["pv" + n + "Power"])
+      ];
+      cells.forEach(function (text) {
+        var td = document.createElement("td");
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
+  }
+
   function render(data) {
     document.getElementById("deviceName").textContent = data.deviceName || "AlphaESS Inverter";
     document.getElementById("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
 
-    document.getElementById("pvPower").textContent = formatPower(data.pvPower);
-    document.getElementById("gridPower").textContent = formatPower(Math.abs(data.gridPower));
-    document.getElementById("gridDirection").textContent =
-      data.gridPower < 0 ? "\u2190 Exporting to grid" : (data.gridPower > 0 ? "\u2192 Importing from grid" : "Idle");
+    var metaParts = [];
+    if (data.inverter) {
+      if (typeof data.inverter.invTemperature === "number") metaParts.push("Inverter " + fmt(data.inverter.invTemperature, 1, "\u00b0C"));
+      if (data.inverter.invWorkMode) metaParts.push(data.inverter.invWorkMode);
+      if (data.inverter.systemTime) metaParts.push(data.inverter.systemTime);
+    }
+    document.getElementById("inverterMeta").textContent = metaParts.join(" \u00b7 ");
 
-    document.getElementById("batterySoC").textContent = Number(data.batterySoC).toFixed(1) + "%";
-    var bp = data.batteryPower;
-    document.getElementById("batteryDirection").textContent =
-      Math.abs(bp) < 15 ? (formatPower(bp) + " \u00b7 Idle")
-        : (bp > 0 ? "\u2193 Discharging \u00b7 " + formatPower(bp) : "\u2191 Charging \u00b7 " + formatPower(Math.abs(bp)));
+    var solar = data.solar, battery = data.battery, grid = data.grid;
 
-    document.getElementById("loadPower").textContent = formatPower(data.loadPower);
+    document.getElementById("pvPower").textContent = formatPower(solar ? solar.pvPower : 0);
+    document.getElementById("gridPower").textContent = formatPower(Math.abs(grid ? grid.gridPower : 0));
+    document.getElementById("gridDirection").textContent = !grid ? "-" :
+      (grid.gridPower < 0 ? "\u2190 Exporting to grid" : (grid.gridPower > 0 ? "\u2192 Importing from grid" : "Idle"));
 
-    document.getElementById("lifetimeFeed").textContent = Number(data.lifetimeFeedToGrid).toFixed(2) + " kWh";
-    document.getElementById("lifetimeConsumed").textContent = Number(data.lifetimeConsumedFromGrid).toFixed(2) + " kWh";
+    document.getElementById("batterySoC").textContent = battery ? fmt(battery.batterySoC, 1, "%") : "-";
+    var bp = battery ? battery.batteryPower : 0;
+    document.getElementById("batteryDirection").textContent = !battery ? "-" :
+      battery.batteryFull ? "\u2713 Full"
+      : (Math.abs(bp) < 15 ? (formatPower(bp) + " \u00b7 Idle")
+        : (bp > 0 ? "\u2193 Discharging \u00b7 " + formatPower(bp) : "\u2191 Charging \u00b7 " + formatPower(Math.abs(bp))));
+
+    document.getElementById("loadPower").textContent = formatPower(data.inverter ? data.inverter.loadPower : 0);
+
+    renderSolarDetail(solar);
+    renderBatteryDetail(battery);
+    renderGridDetail(grid);
 
     if (data.errorState) {
       setBanner("Device reporting an error: " + data.errorState);
@@ -339,6 +612,27 @@ def _decode_value(registers: list, signed: bool, decimals: int) -> float:
     return raw / (10 ** decimals) if decimals else raw
 
 
+def _decode_system_time(registers: list) -> str:
+    """Combine the inverter clock's 3 packed registers into a display string.
+
+    Each register packs two plain (non-BCD) byte values - confirmed against
+    SorX14/alphaess_modbus's own formatter.py, which decodes the same
+    registers the same way.
+
+    Args:
+        registers (list): The 3 raw registers read from SYSTEM_TIME_CLUSTER_START,
+            in order: year/month, day/hour, minute/second.
+
+    Returns:
+        str: ``"YYYY-MM-DD HH:MM:SS"``.
+    """
+    year_month, day_hour, minute_second = registers
+    year, month = 2000 + (year_month >> 8), year_month & 0xFF
+    day, hour = day_hour >> 8, day_hour & 0xFF
+    minute, second = minute_second >> 8, minute_second & 0xFF
+    return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, pluginId: str, pluginDisplayName: str, pluginVersion: str, pluginPrefs: indigo.Dict) -> None:
         """Initialize the plugin instance and set the debug logging level.
@@ -395,12 +689,47 @@ class Plugin(indigo.PluginBase):
                 errors_dict["address"] = "Inverter IP address is required."
             elif " " in address:
                 errors_dict["address"] = "IP address must not contain spaces."
+            poll_interval = valuesDict.get("pollInterval", "").strip()
+            try:
+                if int(poll_interval) < MIN_POLL_INTERVAL:
+                    errors_dict["pollInterval"] = f"Poll interval must be at least {MIN_POLL_INTERVAL} seconds."
+            except ValueError:
+                errors_dict["pollInterval"] = "Poll interval must be a whole number of seconds."
         elif typeId in ("solarDevice", "batteryDevice", "gridDevice"):
             if not valuesDict.get("systemDevice", ""):
                 errors_dict["systemDevice"] = "Please select the AlphaESS Inverter this device belongs to."
         if errors_dict:
             return (False, valuesDict, errors_dict)
         return (True, valuesDict)
+
+    def deviceUpdated(self, origDev: indigo.Device, newDev: indigo.Device) -> None:
+        """Indigo calls this whenever any device's properties or states change.
+
+        Used here purely to log a confirmation line when a config field (e.g. Poll
+        Interval) is actually saved with a new value - fires on every poll's state
+        update too, but comparing ``pluginProps`` (unaffected by state updates) rather
+        than the whole device keeps that from producing log spam every poll cycle.
+
+        Args:
+            origDev (indigo.Device): The device's state before the change.
+            newDev (indigo.Device): The device's state after the change.
+        """
+        super().deviceUpdated(origDev, newDev)
+        if newDev.pluginId != self.pluginId or newDev.deviceTypeId != "inverter":
+            return
+        old_props = origDev.pluginProps
+        new_props = newDev.pluginProps
+        for field_id, label in INVERTER_CONFIG_FIELD_LABELS.items():
+            # Only present in old_props for an already-existing device being
+            # edited - absent on first save of a brand new device, which isn't
+            # a "change" worth logging.
+            if field_id not in old_props:
+                continue
+            old_value, new_value = old_props.get(field_id), new_props.get(field_id)
+            if old_value == new_value:
+                continue
+            unit = "s" if field_id == "pollInterval" else ""
+            self.logger.info(f"{newDev.name}: {label} changed from {old_value}{unit} to {new_value}{unit}")
 
     def get_inverters(self, filter: str = "", valuesDict: Optional[indigo.Dict] = None, typeId: str = "", targetId: int = 0) -> list:
         """Dynamic menu list for the Solar/Battery/Grid device's 'AlphaESS Inverter' picker.
@@ -431,7 +760,14 @@ class Plugin(indigo.PluginBase):
                         continue
                     if now < self._next_poll_at.get(dev.id, 0):
                         continue
-                    interval = int(dev.pluginProps.get("pollInterval", 30))
+                    try:
+                        interval = max(MIN_POLL_INTERVAL, int(dev.pluginProps.get("pollInterval", DEFAULT_POLL_INTERVAL)))
+                    except (TypeError, ValueError):
+                        # validateDeviceConfigUi rejects bad values going forward, but a
+                        # device saved before that check existed could still have one on
+                        # disk - falling back here keeps that one device's bad value from
+                        # taking down polling for every other configured inverter.
+                        interval = DEFAULT_POLL_INTERVAL
                     self._next_poll_at[dev.id] = now + interval
                     try:
                         self._poll_inverter(dev)
@@ -601,6 +937,7 @@ class Plugin(indigo.PluginBase):
         grid_ok = GRID_CLUSTER_START in cluster_registers
         battery_ok = BATTERY_CLUSTER_START in cluster_registers
         solar_ok = SOLAR_CLUSTER_START in cluster_registers
+        time_ok = SYSTEM_TIME_CLUSTER_START in cluster_registers
 
         if NEW_DEVICE_NAME_RE.match(dev.name.strip()):
             # Skip creating/updating child devices while this still has
@@ -620,15 +957,24 @@ class Plugin(indigo.PluginBase):
         if grid_ok:
             grid_dev.updateStatesOnServer([
                 {"key": "gridPower", "value": int(values["gridPower"])},
-                {"key": "gridVoltage", "value": values["gridVoltage"], "decimalPlaces": 1},
-                {"key": "gridCurrent", "value": values["gridCurrent"], "decimalPlaces": 1},
-                {"key": "gridFrequency", "value": values["gridFrequency"], "decimalPlaces": 1},
+                {"key": "gridPowerA", "value": int(values["gridPowerA"])},
+                {"key": "gridPowerB", "value": int(values["gridPowerB"])},
+                {"key": "gridPowerC", "value": int(values["gridPowerC"])},
+                {"key": "gridVoltage", "value": int(values["gridVoltage"])},
+                {"key": "gridVoltageB", "value": int(values["gridVoltageB"])},
+                {"key": "gridVoltageC", "value": int(values["gridVoltageC"])},
                 {"key": "lifetimeFeedToGrid", "value": values["lifetimeFeedToGrid"], "decimalPlaces": 2},
                 {"key": "lifetimeConsumedFromGrid", "value": values["lifetimeConsumedFromGrid"], "decimalPlaces": 2},
             ])
             grid_dev.setErrorStateOnServer(None)
         else:
             grid_dev.setErrorStateOnServer(cluster_errors.get(GRID_CLUSTER_START, "Modbus read error"))
+
+        if solar_ok:
+            # gridFrequency is read via the solar/inverter-health cluster
+            # (see the REGISTERS comment for why) - updated on the Grid
+            # device independently of grid_ok/gridCluster's own success.
+            grid_dev.updateStatesOnServer([{"key": "gridFrequency", "value": values["gridFrequency"], "decimalPlaces": 2}])
 
         if battery_ok:
             battery_dev.updateStatesOnServer([
@@ -644,6 +990,8 @@ class Plugin(indigo.PluginBase):
                 {"key": "batteryCapacity", "value": values["batteryCapacity"], "decimalPlaces": 1},
                 {"key": "batteryChargeEnergy", "value": values["batteryChargeEnergy"], "decimalPlaces": 1},
                 {"key": "batteryDischargeEnergy", "value": values["batteryDischargeEnergy"], "decimalPlaces": 1},
+                {"key": "batteryFull", "value": int(values["batteryStatus"]) == 1},
+                {"key": "batteryRemainingTime", "value": int(values["batteryRemainingTime"])},
             ])
             battery_dev.setErrorStateOnServer(None)
         else:
@@ -666,6 +1014,12 @@ class Plugin(indigo.PluginBase):
         inverter_states = []
         if solar_ok:
             inverter_states.append({"key": "invTemperature", "value": values["invTemperature"], "decimalPlaces": 1})
+            inverter_states.append({
+                "key": "invWorkMode",
+                "value": INVERTER_WORK_MODE_LABELS.get(int(values["invWorkMode"]), f"Unknown work mode ({int(values['invWorkMode'])})"),
+            })
+        if time_ok:
+            inverter_states.append({"key": "systemTime", "value": _decode_system_time(cluster_registers[SYSTEM_TIME_CLUSTER_START])})
         if grid_ok and battery_ok and solar_ok:
             # Matches the Hillview integration's "house load" formula: PV +
             # battery output + grid import all flow into the house, whichever
@@ -751,9 +1105,10 @@ class Plugin(indigo.PluginBase):
                 return reply
 
             # pvPower/gridPower/batteryPower/etc. live on the Solar/Battery/Grid
-            # child devices, not on the parent inverter device itself - the
-            # dashboard's own JS is unchanged, it just gets its numbers
-            # gathered from four devices instead of one now.
+            # child devices, not on the parent inverter device itself - each
+            # gets handed to the dashboard page as its own object (null if that
+            # child hasn't been created yet), carrying every state it has
+            # rather than just the handful the top summary tiles need.
             solar = self._find_child(target.id, "solarDevice")
             battery = self._find_child(target.id, "batteryDevice")
             grid = self._find_child(target.id, "gridDevice")
@@ -765,14 +1120,10 @@ class Plugin(indigo.PluginBase):
                 "deviceName": target.name,
                 "devices": device_list,
                 "errorState": error_state,
-                "pvPower": solar.states.get("pvPower", 0) if solar else 0,
-                "gridPower": grid.states.get("gridPower", 0) if grid else 0,
-                "batteryPower": battery.states.get("batteryPower", 0) if battery else 0,
-                "batterySoC": battery.states.get("batterySoC", 0) if battery else 0,
-                "batterySoH": battery.states.get("batterySoH", 0) if battery else 0,
-                "loadPower": target.states.get("loadPower", 0),
-                "lifetimeFeedToGrid": grid.states.get("lifetimeFeedToGrid", 0) if grid else 0,
-                "lifetimeConsumedFromGrid": grid.states.get("lifetimeConsumedFromGrid", 0) if grid else 0,
+                "inverter": {k: target.states.get(k, 0) for k in INVERTER_STATE_KEYS},
+                "solar": {k: solar.states.get(k, 0) for k in SOLAR_STATE_KEYS} if solar else None,
+                "battery": {k: battery.states.get(k, 0) for k in BATTERY_STATE_KEYS} if battery else None,
+                "grid": {k: grid.states.get(k, 0) for k in GRID_STATE_KEYS} if grid else None,
             }
             reply["content"] = json.dumps(payload)
             return reply

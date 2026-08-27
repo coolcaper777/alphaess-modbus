@@ -17,8 +17,17 @@
                 <Label>Modbus Unit/Slave ID:</Label>
                 <Description>AlphaESS inverters use 85 (0x55) - only change this if yours differs</Description>
             </Field>
-            <Field id="pollInterval" type="textfield" defaultValue="30">
-                <Label>Poll Interval (seconds):</Label>
+            <Field id="pollInterval" type="menu" defaultValue="30">
+                <Label>Poll Interval:</Label>
+                <Description>AlphaESS's own Modbus spec recommends polling no faster than every 5 seconds - going faster risks overloading the inverter's Modbus interface. 30 seconds is a good default for home monitoring.</Description>
+                <List>
+                    <Option value="5">5 seconds (not recommended - below AlphaESS's own minimum)</Option>
+                    <Option value="10">10 seconds</Option>
+                    <Option value="15">15 seconds</Option>
+                    <Option value="30">30 seconds (default)</Option>
+                    <Option value="60">1 minute</Option>
+                    <Option value="300">5 minutes</Option>
+                </List>
             </Field>
         </ConfigUI>
         <States>
@@ -33,6 +42,16 @@
                 <TriggerLabel>Inverter Temperature Changed</TriggerLabel>
                 <ControlPageLabel>Inverter Temperature</ControlPageLabel>
                 <Units>°C</Units>
+            </State>
+            <State id="invWorkMode">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Inverter Work Mode Changed</TriggerLabel>
+                <ControlPageLabel>Work Mode</ControlPageLabel>
+            </State>
+            <State id="systemTime">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Inverter System Time Changed</TriggerLabel>
+                <ControlPageLabel>System Time</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>loadPower</UiDisplayStateId>
@@ -248,6 +267,17 @@
                 <ControlPageLabel>Lifetime Discharge Energy</ControlPageLabel>
                 <Units>kWh</Units>
             </State>
+            <State id="batteryFull">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Battery Full Changed</TriggerLabel>
+                <ControlPageLabel>Battery Full</ControlPageLabel>
+            </State>
+            <State id="batteryRemainingTime">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Battery Remaining Time Changed</TriggerLabel>
+                <ControlPageLabel>Time to Full/Empty</ControlPageLabel>
+                <Units>min</Units>
+            </State>
         </States>
         <UiDisplayStateId>batterySoC</UiDisplayStateId>
     </Device>
@@ -265,20 +295,44 @@
             <State id="gridPower">
                 <ValueType>Integer</ValueType>
                 <TriggerLabel>Grid Power Changed</TriggerLabel>
-                <ControlPageLabel>Grid Power</ControlPageLabel>
+                <ControlPageLabel>Grid Power (Total)</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="gridPowerA">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Grid Power Phase A Changed</TriggerLabel>
+                <ControlPageLabel>Grid Power - Phase A</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="gridPowerB">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Grid Power Phase B Changed</TriggerLabel>
+                <ControlPageLabel>Grid Power - Phase B</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="gridPowerC">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Grid Power Phase C Changed</TriggerLabel>
+                <ControlPageLabel>Grid Power - Phase C</ControlPageLabel>
                 <Units>W</Units>
             </State>
             <State id="gridVoltage">
                 <ValueType>Number</ValueType>
                 <TriggerLabel>Grid Voltage Changed</TriggerLabel>
-                <ControlPageLabel>Voltage</ControlPageLabel>
+                <ControlPageLabel>Voltage - Phase A</ControlPageLabel>
                 <Units>V</Units>
             </State>
-            <State id="gridCurrent">
+            <State id="gridVoltageB">
                 <ValueType>Number</ValueType>
-                <TriggerLabel>Grid Current Changed</TriggerLabel>
-                <ControlPageLabel>Current</ControlPageLabel>
-                <Units>A</Units>
+                <TriggerLabel>Grid Voltage Phase B Changed</TriggerLabel>
+                <ControlPageLabel>Voltage - Phase B</ControlPageLabel>
+                <Units>V</Units>
+            </State>
+            <State id="gridVoltageC">
+                <ValueType>Number</ValueType>
+                <TriggerLabel>Grid Voltage Phase C Changed</TriggerLabel>
+                <ControlPageLabel>Voltage - Phase C</ControlPageLabel>
+                <Units>V</Units>
             </State>
             <State id="gridFrequency">
                 <ValueType>Number</ValueType>

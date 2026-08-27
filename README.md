@@ -36,12 +36,14 @@ The parent device — holds the connection config, auto-discovers the three devi
 | Inverter IP Address | Local IP of the inverter's LAN port |
 | Modbus TCP Port | Default `502` |
 | Modbus Unit/Slave ID | Default `85` (`0x55`) — AlphaESS inverters don't use the Modbus default of `1`; only change this if yours differs |
-| Poll Interval (seconds) | Default `30` |
+| Poll Interval | Dropdown: 5s (not recommended)/10s/15s/30s (default)/1m/5m — AlphaESS's own Modbus spec recommends 5s+ |
 
 | State | Description |
 |---|---|
 | `loadPower` | Computed house load: `pvPower + batteryPower + gridPower` (W) |
 | `invTemperature` | Inverter internal temperature (°C) |
+| `invWorkMode` | Inverter operating mode (`Normal`, `Bypass/EPS`, or `Unknown work mode (N)` for any other model-specific code) |
+| `systemTime` | Inverter's own clock, as reported by the inverter (`YYYY-MM-DD HH:MM:SS`) |
 
 ### AlphaESS Solar (`solarDevice`)
 
@@ -68,6 +70,8 @@ Auto-created under the Inverter.
 | `batteryMinCellTemp` / `batteryMaxCellTemp` | Min/max individual cell temperature (°C) |
 | `batteryCapacity` | Rated capacity (kWh) |
 | `batteryChargeEnergy` / `batteryDischargeEnergy` | Lifetime energy charged/discharged (kWh) |
+| `batteryFull` | `true` when the BMS itself reports the battery as full |
+| `batteryRemainingTime` | BMS estimate of time to full charge or empty, whichever direction the battery is currently going (min) |
 
 A battery-less installation is currently **untested** — if you run one and see a `Modbus read error` on this device rather than sensible `0` values, please open an issue with your plugin log. It won't affect the Solar or Grid devices either way, since each is read and reported independently.
 
@@ -77,10 +81,16 @@ Auto-created under the Inverter.
 
 | State | Description |
 |---|---|
-| `gridPower` | Grid power — negative = exporting, positive = importing (W) |
-| `gridVoltage` / `gridCurrent` / `gridFrequency` | Grid connection point readings (V/A/Hz) — useful for diagnosing grid quality issues |
+| `gridPower` | Total grid power — negative = exporting, positive = importing (W) |
+| `gridPowerA` / `gridPowerB` / `gridPowerC` | Per-phase grid power (W) — on a single-phase installation, B/C simply read `0` |
+| `gridVoltage` / `gridVoltageB` / `gridVoltageC` | Per-phase grid voltage (V) - if you have a SMILE-B3/SMILE-B3-PLUS inverter and this reads ~10x too low, [open an issue](https://github.com/coolcaper777/alphaess-modbus/issues); that model variant scales this register differently |
+| `gridFrequency` | Grid frequency (Hz), read from the inverter's own frequency sensor |
 | `lifetimeFeedToGrid` | Lifetime energy exported to grid (kWh) |
 | `lifetimeConsumedFromGrid` | Lifetime energy imported from grid (kWh) |
+
+Grid current isn't exposed - neither of the two independent, actively-maintained community register maps this plugin cross-checks against (see Credits) documents that register, so there's no verified source for its scale or reliability. It's derivable from `gridPower / gridVoltage` per phase if you need it.
+
+The dashboard shows a per-phase Voltage/Power table automatically once it detects phase B or C carrying real voltage; a single-phase installation just sees the plain Voltage row it always has.
 
 ## Debug logging
 
@@ -101,7 +111,7 @@ If you have an existing **AlphaESS Inverter** device from before this device was
 ## Credits
 
 - **Plugin:** authored by [coolcaper777](https://github.com/coolcaper777).
-- **Register map:** derived from [`SorX14/alphaess_modbus`](https://github.com/SorX14/alphaess_modbus) (MIT-licensed), cross-checked against the dispatch register documentation at [projects.hillviewlodge.ie/alphaess](https://projects.hillviewlodge.ie/alphaess/).
+- **Register map:** derived from [`SorX14/alphaess_modbus`](https://github.com/SorX14/alphaess_modbus) (MIT-licensed), cross-checked against [`senalse/ha-alphaess-modbus`](https://github.com/senalse/ha-alphaess-modbus) and the Home Assistant Modbus YAML at [projects.hillviewlodge.ie/alphaess](https://projects.hillviewlodge.ie/alphaess/) - the latter verified working against the user's own hardware.
 - **Modbus library:** [`pymodbus`](https://github.com/pymodbus-dev/pymodbus).
 - **Hardware:** [AlphaESS](https://www.alphaess.com/) hybrid inverters.
 - **This plugin and its documentation** were built with [Claude Code](https://claude.com/claude-code) (Anthropic).
