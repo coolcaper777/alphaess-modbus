@@ -152,6 +152,53 @@ REGISTERS = {
 # fallback rather than guessed.
 INVERTER_WORK_MODE_LABELS = {1: "Normal", 2: "Bypass/EPS"}
 
+# Dispatch register block: 11 consecutive holding registers 0x0880-0x088A
+# (2176-2186), written atomically via Modbus function code 16
+# (write_registers) as one call. Confirmed NOT flash-backed - unlike the
+# inverter's scheduler-config registers (max_feed_to_grid, charge/discharge
+# cutoff SoC, charge/discharge time periods), which this plugin deliberately
+# never writes. Source: https://projects.hillviewlodge.ie/alphaess/'s own
+# author, in comments on that page: "Force Charging uses the Dispatch
+# registers instead (which are not stored in the flash memory)." Register
+# layout and the mode/scale constants below cross-checked against
+# senalse/ha-alphaess-modbus's docs/register_map.md and switch.py/const.py.
+#
+# Word layout (offset from DISPATCH_START_ADDRESS):
+#   0    : Start (1=start, 0=stop)
+#   1-2  : Active Power, 32-bit, 32000-biased (raw = 32000 - watts to charge,
+#          32000 + watts to discharge, 32000 = neutral)
+#   3-4  : Reactive Power, 32-bit, 32000 = neutral (always written neutral here)
+#   5    : Mode - see DISPATCH_MODE_LABELS
+#   6    : SoC target, raw = percent / DISPATCH_SOC_SCALE (only meaningful in
+#          mode 2, State of Charge Control)
+#   7-8  : Time, 32-bit, duration in seconds
+#   9    : Flow Direction - always written as the constant DISPATCH_FLOW_DIRECTION
+#   10   : PV Switch (0=unchanged, 1=on, 2=off) - only takes effect during an
+#          active dispatch
+DISPATCH_START_ADDRESS = 0x0880
+DISPATCH_SOC_SCALE = 0.392
+DISPATCH_MODE_SOC_CONTROL = 2
+DISPATCH_FLOW_DIRECTION = 255
+DISPATCH_PV_UNCHANGED = 0
+
+# Force Charging/Discharging always write mode 2 (SoC Control) - the reference
+# implementation (senalse/ha-alphaess-modbus's switch.py) does the same for
+# every one of its "Force" convenience switches, never exposing a mode picker
+# on them: a fixed power target + SoC cutoff IS what SoC Control mode means,
+# and every other mode would silently ignore one or both of those fields (see
+# the mode-applicability comment on dispatch_action below). Mode choice is
+# only exposed on the generic Dispatch action.
+DISPATCH_MODE_LABELS = {
+    1: "Battery only Charges from PV",
+    2: "State of Charge Control",
+    3: "Load Following",
+    4: "Maximise Output",
+    5: "Normal Mode",
+    6: "Optimise Consumption",
+    7: "Maximise Consumption",
+    19: "No Battery Charge",
+}
+
 PV_STRINGS = range(1, 7)
 # Not 1053 - widened by 1 register to also cover gridFrequency at 1052 (see
 # the REGISTERS comment above for why that value lives in this cluster).
@@ -647,6 +694,12 @@ class Plugin(indigo.PluginBase):
         self.debug = self.pluginPrefs.get("showDebugInfo", False)
         self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
         self._next_poll_at: dict = {}
+        # inverter device id -> epoch time an active dispatch should auto-stop.
+        # Checked on runConcurrentThread's 5-second tick (independent of each
+        # device's own, possibly slower pollInterval), mirroring the reference
+        # HA implementation's in-memory auto-off timer without needing
+        # Indigo-side scheduling.
+        self._dispatch_end_at: dict = {}
 
     def startup(self) -> None:
         """Called once by Indigo when the plugin starts running."""
@@ -773,6 +826,21 @@ class Plugin(indigo.PluginBase):
                         self._poll_inverter(dev)
                     except Exception:
                         self.logger.exception(f"Error polling {dev.name}")
+
+                # Auto-off for any active dispatch whose duration has expired -
+                # checked every 5s regardless of each device's own pollInterval,
+                # since this is independent of register reads.
+                for dev_id, end_at in list(self._dispatch_end_at.items()):
+                    if now < end_at:
+                        continue
+                    if dev_id not in indigo.devices:
+                        self._dispatch_end_at.pop(dev_id, None)
+                        continue
+                    try:
+                        self._stop_dispatch(indigo.devices[dev_id], reason="duration expired")
+                    except Exception:
+                        self.logger.exception(f"Error auto-stopping dispatch for device {dev_id}")
+
                 self.sleep(5)
         except self.StopThread:
             pass
@@ -804,6 +872,7 @@ class Plugin(indigo.PluginBase):
         super().deviceStopComm(dev)
         self.logger.debug(f"deviceStopComm: {dev.name}")
         self._next_poll_at.pop(dev.id, None)
+        self._dispatch_end_at.pop(dev.id, None)
 
     def _get_or_create_child(self, parent_dev: indigo.Device, type_id: str, label: str) -> indigo.Device:
         """Return a parent inverter's Solar/Battery/Grid child device, creating it if missing.
@@ -1036,6 +1105,269 @@ class Plugin(indigo.PluginBase):
         else:
             missing = [name for name, ok in (("solar", solar_ok), ("battery", battery_ok), ("grid", grid_ok)) if not ok]
             dev.setErrorStateOnServer(f"Partial read this cycle - {'/'.join(missing)} unavailable (see that device)")
+
+    def _open_dispatch_client(self, dev: indigo.Device) -> Optional[tuple]:
+        """Connect a Modbus client for a dispatch write against an inverter device.
+
+        Mirrors the connect logic in ``_poll_inverter`` but returns instead of
+        setting the device's own error state - a dispatch command failing to
+        connect shouldn't overwrite whatever error/OK state the last register
+        poll left in place.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device the action targets.
+
+        Returns:
+            Optional[tuple]: ``(client, unit_id)`` if connected, or None (with
+                the failure already logged) on any config/connection failure.
+        """
+        address = dev.pluginProps.get("address", "")
+        if not address:
+            self.logger.error(f"{dev.name}: No IP address configured - cannot send dispatch command")
+            return None
+        try:
+            port = int(dev.pluginProps.get("port", 502))
+            unit_id = int(dev.pluginProps.get("unitId", DEFAULT_UNIT_ID))
+        except (TypeError, ValueError):
+            self.logger.error(f"{dev.name}: Invalid Port or Unit ID - cannot send dispatch command")
+            return None
+        client = ModbusTcpClient(address, port=port, timeout=5)
+        if not client.connect():
+            self.logger.error(f"{dev.name}: could not connect to {address}:{port} - cannot send dispatch command")
+            return None
+        return client, unit_id
+
+    @staticmethod
+    def _resolve_number(override, device_default, fallback: float) -> float:
+        """Resolve an optional Action field, falling back to a device default, then a hardcoded fallback.
+
+        Args:
+            override: The Action instance's own field value (may be blank/None).
+            device_default: The inverter device's configured default for this field (may be blank/None).
+            fallback (float): Used only if both override and device_default are blank/invalid.
+
+        Returns:
+            float: The resolved numeric value.
+        """
+        for raw in (override, device_default):
+            text = (raw or "").strip()
+            if text:
+                try:
+                    return float(text)
+                except ValueError:
+                    continue
+        return fallback
+
+    def _write_dispatch(self, client: ModbusTcpClient, unit_id: int, *, power_raw: int, mode: int,
+                         soc_raw: int, duration_s: int, pv_switch: int = DISPATCH_PV_UNCHANGED) -> None:
+        """Write the 11-register Dispatch block (DISPATCH_START_ADDRESS) as one atomic write.
+
+        Not flash-backed - safe to write as often as needed (see the
+        DISPATCH_START_ADDRESS comment above for the source confirming this).
+
+        Args:
+            client (ModbusTcpClient): An already-connected Modbus client.
+            unit_id (int): The inverter's Modbus unit/slave ID.
+            power_raw (int): 32000-biased active power word (<32000 charges, >32000 discharges).
+            mode (int): Dispatch mode code - see DISPATCH_MODE_LABELS.
+            soc_raw (int): SoC target word (percent / DISPATCH_SOC_SCALE) - only meaningful in mode 2.
+            duration_s (int): Dispatch duration in seconds.
+            pv_switch (int): 0=unchanged, 1=PV on, 2=PV off - only takes effect during an active dispatch.
+
+        Raises:
+            ModbusException: If the write itself reports an error.
+        """
+        values = [1, 0, power_raw, 0, 32000, mode, soc_raw, 0, duration_s, DISPATCH_FLOW_DIRECTION, pv_switch]
+        result = client.write_registers(DISPATCH_START_ADDRESS, values, device_id=unit_id)
+        if result.isError():
+            raise ModbusException(f"error writing dispatch registers: {result}")
+
+    def _start_dispatch(self, dev: indigo.Device, *, dispatch_type: str, power_raw: int, mode: int,
+                         soc_raw: int, duration_s: int, dispatch_power_w: int,
+                         pv_switch: int = DISPATCH_PV_UNCHANGED) -> None:
+        """Write a Dispatch command and update the inverter device's dispatch states.
+
+        Shared by force_charging_action/force_discharging_action/dispatch_action.
+        Mutual exclusivity between dispatch types needs no special handling
+        here: the inverter only ever holds one dispatch config on the wire, so
+        starting a new one already supersedes whatever was active before -
+        this just overwrites the tracked state to match.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device to dispatch on.
+            dispatch_type (str): Which action started this (e.g. "forceCharging").
+            power_raw (int): 32000-biased active power word.
+            mode (int): Dispatch mode code.
+            soc_raw (int): SoC target word.
+            duration_s (int): Dispatch duration in seconds.
+            dispatch_power_w (int): Signed watts for the dispatchPowerTarget state
+                (positive=discharging, negative=charging - same convention as
+                the batteryPower state).
+            pv_switch (int): 0=unchanged, 1=PV on, 2=PV off.
+        """
+        opened = self._open_dispatch_client(dev)
+        if opened is None:
+            return
+        client, unit_id = opened
+        try:
+            self._write_dispatch(client, unit_id, power_raw=power_raw, mode=mode, soc_raw=soc_raw,
+                                  duration_s=duration_s, pv_switch=pv_switch)
+        except ModbusException:
+            self.logger.exception(f"{dev.name}: error writing dispatch command")
+            return
+        finally:
+            client.close()
+
+        end_at = time.time() + duration_s
+        self._dispatch_end_at[dev.id] = end_at
+        mode_label = DISPATCH_MODE_LABELS.get(mode, f"Unknown mode ({mode})")
+        dev.updateStatesOnServer([
+            {"key": "dispatchActive", "value": True},
+            {"key": "dispatchType", "value": dispatch_type},
+            {"key": "dispatchModeLabel", "value": mode_label},
+            {"key": "dispatchPowerTarget", "value": dispatch_power_w},
+            {"key": "dispatchEndsAt", "value": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_at))},
+        ])
+        self.logger.info(
+            f"{dev.name}: Dispatch started - type={dispatch_type}, mode={mode_label}, "
+            f"power={dispatch_power_w}W, duration={duration_s}s"
+        )
+
+    def _stop_dispatch(self, dev: indigo.Device, *, reason: str) -> None:
+        """Write the Dispatch stop command (word 0 = 0) and clear the device's dispatch states.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device to stop dispatch on.
+            reason (str): Human-readable reason, logged (e.g. "user requested" or "duration expired").
+        """
+        self._dispatch_end_at.pop(dev.id, None)
+        opened = self._open_dispatch_client(dev)
+        if opened is None:
+            return
+        client, unit_id = opened
+        try:
+            result = client.write_registers(DISPATCH_START_ADDRESS, [0] * 11, device_id=unit_id)
+            if result.isError():
+                raise ModbusException(f"error writing dispatch stop: {result}")
+        except ModbusException:
+            self.logger.exception(f"{dev.name}: error stopping dispatch")
+            return
+        finally:
+            client.close()
+
+        self.logger.info(f"{dev.name}: Dispatch stopped ({reason})")
+        dev.updateStatesOnServer([
+            {"key": "dispatchActive", "value": False},
+            {"key": "dispatchType", "value": ""},
+            {"key": "dispatchModeLabel", "value": ""},
+            {"key": "dispatchPowerTarget", "value": 0},
+            {"key": "dispatchEndsAt", "value": ""},
+        ])
+
+    def force_charging_action(self, pluginAction: indigo.PluginAction) -> None:
+        """Actions.xml callback for Force Charging.
+
+        Writes the Dispatch block with mode 2 (State of Charge Control),
+        charging at the configured power until the cutoff SoC or duration
+        elapses - whichever the inverter reaches first.
+
+        Args:
+            pluginAction (indigo.PluginAction): The action instance, including
+                ``deviceId`` and any per-call field overrides in ``props``.
+        """
+        dev = indigo.devices[pluginAction.deviceId]
+        power_kw = self._resolve_number(pluginAction.props.get("power"), dev.pluginProps.get("forceChargingPower"), 5.0)
+        cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), dev.pluginProps.get("forceChargingCutoffSoC"), 100.0)
+        duration_min = self._resolve_number(pluginAction.props.get("duration"), dev.pluginProps.get("forceChargingDuration"), 120.0)
+        duration_s = int(duration_min * 60)
+        if duration_s <= 0:
+            self.logger.error(f"{dev.name}: Force Charging duration must be greater than 0")
+            return
+        power_raw = int(32000 - power_kw * 1000)
+        soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
+        self._start_dispatch(
+            dev, dispatch_type="forceCharging", power_raw=power_raw, mode=DISPATCH_MODE_SOC_CONTROL,
+            soc_raw=soc_raw, duration_s=duration_s, dispatch_power_w=int(-power_kw * 1000),
+        )
+
+    def force_discharging_action(self, pluginAction: indigo.PluginAction) -> None:
+        """Actions.xml callback for Force Discharging.
+
+        Writes the Dispatch block with mode 2 (State of Charge Control),
+        discharging at the configured power until the cutoff SoC or duration
+        elapses - whichever the inverter reaches first.
+
+        Args:
+            pluginAction (indigo.PluginAction): The action instance, including
+                ``deviceId`` and any per-call field overrides in ``props``.
+        """
+        dev = indigo.devices[pluginAction.deviceId]
+        power_kw = self._resolve_number(pluginAction.props.get("power"), dev.pluginProps.get("forceDischargingPower"), 5.0)
+        cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), dev.pluginProps.get("forceDischargingCutoffSoC"), 20.0)
+        duration_min = self._resolve_number(pluginAction.props.get("duration"), dev.pluginProps.get("forceDischargingDuration"), 120.0)
+        duration_s = int(duration_min * 60)
+        if duration_s <= 0:
+            self.logger.error(f"{dev.name}: Force Discharging duration must be greater than 0")
+            return
+        power_raw = int(32000 + power_kw * 1000)
+        soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
+        self._start_dispatch(
+            dev, dispatch_type="forceDischarging", power_raw=power_raw, mode=DISPATCH_MODE_SOC_CONTROL,
+            soc_raw=soc_raw, duration_s=duration_s, dispatch_power_w=int(power_kw * 1000),
+        )
+
+    def dispatch_action(self, pluginAction: indigo.PluginAction) -> None:
+        """Actions.xml callback for the generic Dispatch action (all 8 modes).
+
+        Unlike Force Charging/Discharging, the power word only applies in
+        modes 1/2/3/5 - modes 4/6/7/19 are algorithm-driven and always run
+        neutral regardless of the power field - and the SoC-target word only
+        applies in mode 2. See DISPATCH_MODE_LABELS and the module-level
+        comment above DISPATCH_START_ADDRESS.
+
+        Args:
+            pluginAction (indigo.PluginAction): The action instance, including
+                ``deviceId`` and its ``mode``/``power``/``cutoffSoC``/``duration``/
+                ``pvSwitch`` fields.
+        """
+        dev = indigo.devices[pluginAction.deviceId]
+        try:
+            mode = int(pluginAction.props.get("mode", DISPATCH_MODE_SOC_CONTROL))
+        except (TypeError, ValueError):
+            mode = DISPATCH_MODE_SOC_CONTROL
+        power_kw = self._resolve_number(pluginAction.props.get("power"), None, 0.0)
+        cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), None, 100.0)
+        duration_min = self._resolve_number(pluginAction.props.get("duration"), None, 120.0)
+        duration_s = int(duration_min * 60)
+        if duration_s <= 0:
+            self.logger.error(f"{dev.name}: Dispatch duration must be greater than 0")
+            return
+        try:
+            pv_switch = int(pluginAction.props.get("pvSwitch", DISPATCH_PV_UNCHANGED))
+        except (TypeError, ValueError):
+            pv_switch = DISPATCH_PV_UNCHANGED
+
+        if mode in (1, 2, 3, 5):
+            power_raw = int(32000 + power_kw * 1000)
+            dispatch_power_w = int(power_kw * 1000)
+        else:
+            power_raw = 32000
+            dispatch_power_w = 0
+        soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE) if mode == DISPATCH_MODE_SOC_CONTROL else 0
+
+        self._start_dispatch(
+            dev, dispatch_type="dispatch", power_raw=power_raw, mode=mode, soc_raw=soc_raw,
+            duration_s=duration_s, dispatch_power_w=dispatch_power_w, pv_switch=pv_switch,
+        )
+
+    def dispatch_reset_action(self, pluginAction: indigo.PluginAction) -> None:
+        """Actions.xml callback for Dispatch Reset - stops any active dispatch.
+
+        Args:
+            pluginAction (indigo.PluginAction): The action instance, including ``deviceId``.
+        """
+        dev = indigo.devices[pluginAction.deviceId]
+        self._stop_dispatch(dev, reason="user requested")
 
     def dashboard(self, action, dev=None, caller_waiting_for_result=None):
         """Serve the live AlphaESS dashboard page.

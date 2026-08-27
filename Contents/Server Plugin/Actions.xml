@@ -13,4 +13,92 @@
         <Name>AlphaESS dashboard live data</Name>
         <CallbackMethod>dashboard_data</CallbackMethod>
     </Action>
+
+    <!-- Dispatch actions - write the 11-register Dispatch block (0x0880-0x088A),
+         confirmed NOT flash-backed (see plugin.py's DISPATCH_START_ADDRESS
+         comment), unlike the inverter's scheduler-config registers which are
+         deliberately never written by this plugin. Force Charging/Discharging
+         hardcode Dispatch Mode 2 (State of Charge Control) - a mode picker on
+         these would let a power/SoC setpoint silently go ignored, since only
+         mode 2 honors the SoC target and only modes 1/2/3/5 honor the power
+         word at all. Mode choice is reserved for the generic Dispatch action. -->
+    <Action id="forceCharging" deviceFilter="self.inverter">
+        <Name>Force Charging</Name>
+        <CallbackMethod>force_charging_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="power" type="textfield">
+                <Label>Power (kW):</Label>
+                <Description>Leave blank to use the device's Force Charging Power default</Description>
+            </Field>
+            <Field id="cutoffSoC" type="textfield">
+                <Label>Cutoff SoC (%):</Label>
+                <Description>Leave blank to use the device's Force Charging Cutoff SoC default</Description>
+            </Field>
+            <Field id="duration" type="textfield">
+                <Label>Duration (min):</Label>
+                <Description>Leave blank to use the device's Force Charging Duration default</Description>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="forceDischarging" deviceFilter="self.inverter">
+        <Name>Force Discharging</Name>
+        <CallbackMethod>force_discharging_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="power" type="textfield">
+                <Label>Power (kW):</Label>
+                <Description>Leave blank to use the device's Force Discharging Power default</Description>
+            </Field>
+            <Field id="cutoffSoC" type="textfield">
+                <Label>Cutoff SoC (%):</Label>
+                <Description>Leave blank to use the device's Force Discharging Cutoff SoC default</Description>
+            </Field>
+            <Field id="duration" type="textfield">
+                <Label>Duration (min):</Label>
+                <Description>Leave blank to use the device's Force Discharging Duration default</Description>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="dispatch" deviceFilter="self.inverter">
+        <Name>Dispatch (Advanced)</Name>
+        <CallbackMethod>dispatch_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="mode" type="menu" defaultValue="2">
+                <Label>Mode:</Label>
+                <List>
+                    <Option value="1">Battery only Charges from PV</Option>
+                    <Option value="2">State of Charge Control</Option>
+                    <Option value="3">Load Following</Option>
+                    <Option value="4">Maximise Output</Option>
+                    <Option value="5">Normal Mode</Option>
+                    <Option value="6">Optimise Consumption</Option>
+                    <Option value="7">Maximise Consumption</Option>
+                    <Option value="19">No Battery Charge</Option>
+                </List>
+            </Field>
+            <Field id="power" type="textfield" defaultValue="0">
+                <Label>Power (kW):</Label>
+                <Description>Positive = discharge, negative = charge. Only applies in modes 1/2/3/5 - ignored (inverter runs neutral) in modes 4/6/7/19.</Description>
+            </Field>
+            <Field id="cutoffSoC" type="textfield" defaultValue="100">
+                <Label>Cutoff SoC (%):</Label>
+                <Description>Only applies in State of Charge Control mode (2) - ignored otherwise</Description>
+            </Field>
+            <Field id="duration" type="textfield" defaultValue="120">
+                <Label>Duration (min):</Label>
+            </Field>
+            <Field id="pvSwitch" type="menu" defaultValue="0">
+                <Label>PV Switch:</Label>
+                <Description>Only takes effect while dispatch is active</Description>
+                <List>
+                    <Option value="0">Leave unchanged</Option>
+                    <Option value="1">PV On</Option>
+                    <Option value="2">PV Off</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </Action>
+    <Action id="dispatchReset" deviceFilter="self.inverter">
+        <Name>Dispatch Reset (Stop)</Name>
+        <CallbackMethod>dispatch_reset_action</CallbackMethod>
+    </Action>
 </Actions>

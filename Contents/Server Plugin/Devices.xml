@@ -29,6 +29,30 @@
                     <Option value="300">5 minutes</Option>
                 </List>
             </Field>
+            <Field id="dispatchSeparator" type="separator"/>
+            <Field id="dispatchDefaultsLabel" type="label" alignText="left">
+                <Label>The Force Charging/Discharging actions below use these defaults for any field left blank on the action itself.</Label>
+            </Field>
+            <Field id="forceChargingPower" type="textfield" defaultValue="5.0">
+                <Label>Force Charging Power (kW):</Label>
+            </Field>
+            <Field id="forceChargingCutoffSoC" type="textfield" defaultValue="100">
+                <Label>Force Charging Cutoff SoC (%):</Label>
+                <Description>Charging stops once the battery reaches this level</Description>
+            </Field>
+            <Field id="forceChargingDuration" type="textfield" defaultValue="120">
+                <Label>Force Charging Duration (min):</Label>
+            </Field>
+            <Field id="forceDischargingPower" type="textfield" defaultValue="5.0">
+                <Label>Force Discharging Power (kW):</Label>
+            </Field>
+            <Field id="forceDischargingCutoffSoC" type="textfield" defaultValue="20">
+                <Label>Force Discharging Cutoff SoC (%):</Label>
+                <Description>Discharging stops once the battery reaches this level (a reserve floor)</Description>
+            </Field>
+            <Field id="forceDischargingDuration" type="textfield" defaultValue="120">
+                <Label>Force Discharging Duration (min):</Label>
+            </Field>
         </ConfigUI>
         <States>
             <State id="loadPower">
@@ -52,6 +76,32 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Inverter System Time Changed</TriggerLabel>
                 <ControlPageLabel>System Time</ControlPageLabel>
+            </State>
+            <State id="dispatchActive">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>Dispatch Active Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Active</ControlPageLabel>
+            </State>
+            <State id="dispatchType">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Dispatch Type Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Type</ControlPageLabel>
+            </State>
+            <State id="dispatchModeLabel">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Dispatch Mode Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Mode</ControlPageLabel>
+            </State>
+            <State id="dispatchPowerTarget">
+                <ValueType>Integer</ValueType>
+                <TriggerLabel>Dispatch Power Target Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Power Target</ControlPageLabel>
+                <Units>W</Units>
+            </State>
+            <State id="dispatchEndsAt">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Dispatch Ends At Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Ends At</ControlPageLabel>
             </State>
         </States>
         <UiDisplayStateId>loadPower</UiDisplayStateId>

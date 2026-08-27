@@ -7,7 +7,7 @@ An [Indigo Domotics](https://www.indigodomo.com/) plugin that reads **AlphaESS**
 - **Inverter connection:** local Modbus TCP over the inverter's LAN port — **not available over Wi-Fi**, no cloud/account required
 - **Python dependency:** [`pymodbus`](https://pypi.org/project/pymodbus/) 3.15.0 (bundled)
 
-> This is an unofficial, community-built plugin. It is not affiliated with or endorsed by AlphaESS. **Monitoring only** — it reads telemetry; it does not send dispatch/control commands (force charge/discharge, feed-in limits, etc.) to the inverter.
+> This is an unofficial, community-built plugin. It is not affiliated with or endorsed by AlphaESS. It reads telemetry and also exposes **Force Charging**/**Force Discharging**/**Dispatch**/**Dispatch Reset** actions (see below) built on AlphaESS's Dispatch mechanism, which is not stored in the inverter's flash memory — safe to use as often as needed. The inverter's own internal scheduler settings (max feed-to-grid, charge/discharge cutoff SoC and time periods) *are* flash-backed and are deliberately never written by this plugin.
 
 ## Installation
 
@@ -37,6 +37,8 @@ The parent device — holds the connection config, auto-discovers the three devi
 | Modbus TCP Port | Default `502` |
 | Modbus Unit/Slave ID | Default `85` (`0x55`) — AlphaESS inverters don't use the Modbus default of `1`; only change this if yours differs |
 | Poll Interval | Dropdown: 5s (not recommended)/10s/15s/30s (default)/1m/5m — AlphaESS's own Modbus spec recommends 5s+ |
+| Force Charging Power / Cutoff SoC / Duration | Defaults used by the Force Charging action when its own fields are left blank (kW / % / min) |
+| Force Discharging Power / Cutoff SoC / Duration | Defaults used by the Force Discharging action when its own fields are left blank (kW / % / min) |
 
 | State | Description |
 |---|---|
@@ -44,6 +46,11 @@ The parent device — holds the connection config, auto-discovers the three devi
 | `invTemperature` | Inverter internal temperature (°C) |
 | `invWorkMode` | Inverter operating mode (`Normal`, `Bypass/EPS`, or `Unknown work mode (N)` for any other model-specific code) |
 | `systemTime` | Inverter's own clock, as reported by the inverter (`YYYY-MM-DD HH:MM:SS`) |
+| `dispatchActive` | `true` while a Force Charging/Force Discharging/Dispatch command is running |
+| `dispatchType` | Which action started the active dispatch (`forceCharging`/`forceDischarging`/`dispatch`) |
+| `dispatchModeLabel` | The active dispatch's mode name (e.g. `State of Charge Control`) |
+| `dispatchPowerTarget` | The active dispatch's power target — positive = discharging, negative = charging (W), same convention as `batteryPower` |
+| `dispatchEndsAt` | When the active dispatch will auto-stop (`YYYY-MM-DD HH:MM:SS`), or blank if none is active |
 
 ### AlphaESS Solar (`solarDevice`)
 
@@ -91,6 +98,18 @@ Auto-created under the Inverter.
 Grid current isn't exposed - neither of the two independent, actively-maintained community register maps this plugin cross-checks against (see Credits) documents that register, so there's no verified source for its scale or reliability. It's derivable from `gridPower / gridVoltage` per phase if you need it.
 
 The dashboard shows a per-phase Voltage/Power table automatically once it detects phase B or C carrying real voltage; a single-phase installation just sees the plain Voltage row it always has.
+
+## Dispatch actions
+
+Available as Indigo Actions on any **AlphaESS Inverter** device — usable in Action Groups, Schedules, and Trigger reactions. All four write AlphaESS's Dispatch registers, which are confirmed **not** flash-backed, so there's no wear concern from frequent use (unlike the inverter's own scheduler settings, which this plugin never touches).
+
+- **Force Charging** / **Force Discharging** — charge or discharge the battery at a fixed power until a cutoff SoC or duration is reached, whichever comes first. Power/Cutoff SoC/Duration fields are optional per call — leave any blank to use that Force action's configured default on the Inverter device. Both always run under Dispatch Mode 2 (State of Charge Control) internally; there's no mode picker on these two, since that mode is what "fixed power + SoC target" *means* — any other mode would silently ignore one or both fields.
+- **Dispatch (Advanced)** — the general-purpose action, with a picker for all 8 documented Dispatch modes (Battery only Charges from PV, State of Charge Control, Load Following, Maximise Output, Normal Mode, Optimise Consumption, Maximise Consumption, No Battery Charge). The Power field only applies in modes 1/2/3/5 (the others are algorithm-driven and always run neutral); the Cutoff SoC field only applies in mode 2.
+- **Dispatch Reset (Stop)** — stops whichever dispatch is currently active and returns the inverter to its normal scheduled operation.
+
+A running dispatch auto-stops on its own once its duration elapses — no separate "stop" step needed unless you want to end it early. Starting a new dispatch (of any type) simply replaces whatever was active before, since the inverter only ever holds one dispatch configuration at a time.
+
+**Not yet implemented:** Force Export, Force Import, and Excess Export. Unlike the four actions above, all three need a continuous servo loop against live PV/load/grid readings rather than a single fixed write — a meaningfully bigger, riskier change, deferred to a future release.
 
 ## Debug logging
 
