@@ -58,6 +58,30 @@
             </Field>
         </ConfigUI>
     </Action>
+    <!-- Force Import, unlike the two above, isn't a single fire-and-forget write -
+         it needs a standing servo loop (plugin.py's _service_force_import,
+         serviced once per poll cycle) that keeps correcting the dispatch
+         setpoint so measured grid import converges on the Power target, since
+         house load/PV shift constantly. Also hardcodes Mode 2 for the same
+         reason as Force Charging/Discharging above. -->
+    <Action id="forceImport" deviceFilter="self.inverter">
+        <Name>Force Import</Name>
+        <CallbackMethod>force_import_action</CallbackMethod>
+        <ConfigUI>
+            <Field id="power" type="textfield">
+                <Label>Power (kW):</Label>
+                <Description>Target grid import level. Leave blank to use the device's Force Import Power default</Description>
+            </Field>
+            <Field id="cutoffSoC" type="textfield">
+                <Label>Cutoff SoC (%):</Label>
+                <Description>Leave blank to use the device's Force Import Cutoff SoC default</Description>
+            </Field>
+            <Field id="duration" type="textfield">
+                <Label>Duration (min):</Label>
+                <Description>Leave blank to use the device's Force Import Duration default</Description>
+            </Field>
+        </ConfigUI>
+    </Action>
     <Action id="dispatch" deviceFilter="self.inverter">
         <Name>Dispatch (Advanced)</Name>
         <CallbackMethod>dispatch_action</CallbackMethod>

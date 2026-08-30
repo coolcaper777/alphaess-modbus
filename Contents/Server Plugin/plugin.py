@@ -199,6 +199,52 @@ DISPATCH_MODE_LABELS = {
     19: "No Battery Charge",
 }
 
+# Dispatch parameter valid ranges - cross-checked against two independently
+# maintained sources that agree exactly: senalse/ha-alphaess-modbus's
+# NUMBER_REGISTERS (custom_components/alphaess_modbus/const.py, the min/max
+# declared on its HA number-entity sliders for these same dispatch params)
+# and Hillview Lodge's integration_alpha_ess.yaml input_number helpers
+# (https://projects.hillviewlodge.ie/alphaess/). Cutoff SoC's 4% floor is
+# specific to the Dispatch block - the flash-backed scheduler's own charging
+# cutoff SoC register uses a 10% floor instead, but this plugin never writes
+# that register (see the DISPATCH_START_ADDRESS comment above).
+DISPATCH_SOC_MIN = 4.0
+DISPATCH_SOC_MAX = 100.0
+DISPATCH_DURATION_MIN_MINUTES = 0.0
+DISPATCH_DURATION_MAX_MINUTES = 480.0
+# Absolute outer bound on Power regardless of inverter model - the real cap is
+# whichever is smaller of this and the device's configured acLimitKw (see
+# _resolve_power_limit_kw), matching both reference implementations' own
+# ac_limit_scaled behavior for this same field.
+DISPATCH_POWER_ABSOLUTE_MAX_KW = 20.0
+DEFAULT_AC_LIMIT_KW = 20.0
+
+# Force Import needs a standing servo loop, not a single write - the dispatch
+# block only accepts a fixed charge-power word, but the actual goal (a fixed
+# grid IMPORT level) shifts constantly with house load/PV. Tuning values below
+# are taken directly from senalse/ha-alphaess-modbus's switch.py (proven in
+# production against this same hardware family), not re-derived - see that
+# source's own _SERVO_GAIN comment: a closed loop on the grid meter only
+# (feeding back the calculated house-load estimate instead caused a kilowatt-
+# scale limit cycle, since that estimate is itself derived from battery+grid),
+# critically damped near gain 0.25, so 0.3 gives a fast, essentially
+# overshoot-free response with zero steady-state error.
+#
+# Serviced once per poll cycle (_service_force_import, called at the end of
+# _poll_inverter) rather than HA's ~2s coordinator cadence - this plugin has
+# no equivalent fast tick tied to fresh Modbus reads, and a multi-hour grid
+# top-up goal doesn't need 2-second responsiveness the way a zero-export
+# tariff would. A slower servo just means slower convergence, not incorrect
+# behavior.
+FORCE_IMPORT_SERVO_GAIN = 0.3
+FORCE_IMPORT_SERVO_DEADBAND_W = 80
+FORCE_IMPORT_STALE_REWRITE_S = 60
+# Battery power settling within this band for this long means the inverter's
+# own SoC Control loop has already reached the cutoff and stopped moving
+# power - stop early rather than waiting out the full configured duration.
+FORCE_IMPORT_NEAR_ZERO_BAND_W = 50
+FORCE_IMPORT_NEAR_ZERO_HOLD_S = 10
+
 PV_STRINGS = range(1, 7)
 # Not 1053 - widened by 1 register to also cover gridFrequency at 1052 (see
 # the REGISTERS comment above for why that value lives in this cluster).
@@ -214,7 +260,10 @@ SYSTEM_TIME_CLUSTER_START = 1856
 # dashboard_data to hand the dashboard page every value it has (not just the
 # handful summarized on the four top tiles), grouped per device the same way
 # Devices.xml groups them.
-INVERTER_STATE_KEYS = ["loadPower", "invTemperature", "invWorkMode", "systemTime"]
+INVERTER_STATE_KEYS = [
+    "loadPower", "invTemperature", "invWorkMode", "systemTime",
+    "dispatchActive", "dispatchType", "dispatchModeLabel", "dispatchPowerTarget", "dispatchEndsAt",
+]
 SOLAR_STATE_KEYS = ["pvPower"] + [f"pv{n}{suffix}" for n in PV_STRINGS for suffix in ("Voltage", "Current", "Power")]
 BATTERY_STATE_KEYS = [
     "batteryPower", "batterySoC", "batterySoH", "batteryVoltage", "batteryCurrent",
@@ -322,6 +371,7 @@ DASHBOARD_HTML = """<!doctype html>
   .dot-solar { background: var(--series-solar); }
   .dot-battery { background: var(--series-battery); }
   .dot-home { background: var(--series-home); }
+  .dot-neutral { background: var(--text-muted); }
   .value { font-size: 28px; font-weight: 600; line-height: 1.1; }
   .sub { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
   .details {
@@ -399,6 +449,10 @@ DASHBOARD_HTML = """<!doctype html>
       <h2><span class="dot dot-grid" style="display:inline-block;"></span> Grid detail</h2>
       <div class="rows" id="gridDetail"><span class="empty-note">No grid device yet</span></div>
     </div>
+    <div class="detail-card">
+      <h2><span class="dot dot-neutral" style="display:inline-block;"></span> Dispatch</h2>
+      <div class="rows" id="dispatchDetail"><span class="empty-note">No dispatch currently active</span></div>
+    </div>
   </div>
 
   <footer>Auto-refreshes every 5 seconds.</footer>
@@ -407,6 +461,7 @@ DASHBOARD_HTML = """<!doctype html>
 (function () {
   var POLL_MS = 5000;
   var selectedDeviceId = null;
+  var DISPATCH_TYPE_LABELS = {forceCharging: "Force Charging", forceDischarging: "Force Discharging", dispatch: "Dispatch"};
   var deviceSelect = document.getElementById("deviceSelect");
 
   function formatPower(watts) {
@@ -481,6 +536,21 @@ DASHBOARD_HTML = """<!doctype html>
   // sensor jitter on an unused phase as a real 3-phase installation.
   function isThreePhase(grid) {
     return Math.abs(grid.gridVoltageB) > 1 || Math.abs(grid.gridVoltageC) > 1;
+  }
+
+  function renderDispatchDetail(inverter) {
+    var container = document.getElementById("dispatchDetail");
+    container.replaceChildren();
+    if (!inverter || !inverter.dispatchActive) {
+      container.appendChild(Object.assign(document.createElement("span"), {className: "empty-note", textContent: "No dispatch currently active"}));
+      return;
+    }
+    container.appendChild(row("Type", DISPATCH_TYPE_LABELS[inverter.dispatchType] || inverter.dispatchType || "-"));
+    container.appendChild(row("Mode", inverter.dispatchModeLabel || "-"));
+    var pw = inverter.dispatchPowerTarget || 0;
+    container.appendChild(row("Power target", pw === 0 ? "Neutral"
+      : (pw > 0 ? "\u2193 Discharging \u00b7 " + formatPower(pw) : "\u2191 Charging \u00b7 " + formatPower(Math.abs(pw)))));
+    container.appendChild(row("Ends at", inverter.dispatchEndsAt || "-"));
   }
 
   function renderGridDetail(grid) {
@@ -565,6 +635,9 @@ DASHBOARD_HTML = """<!doctype html>
       if (typeof data.inverter.invTemperature === "number") metaParts.push("Inverter " + fmt(data.inverter.invTemperature, 1, "\u00b0C"));
       if (data.inverter.invWorkMode) metaParts.push(data.inverter.invWorkMode);
       if (data.inverter.systemTime) metaParts.push(data.inverter.systemTime);
+      if (data.inverter.dispatchActive) {
+        metaParts.push("Dispatch: " + (DISPATCH_TYPE_LABELS[data.inverter.dispatchType] || data.inverter.dispatchType || "active"));
+      }
     }
     document.getElementById("inverterMeta").textContent = metaParts.join(" \u00b7 ");
 
@@ -587,6 +660,7 @@ DASHBOARD_HTML = """<!doctype html>
     renderSolarDetail(solar);
     renderBatteryDetail(battery);
     renderGridDetail(grid);
+    renderDispatchDetail(data.inverter);
 
     if (data.errorState) {
       setBanner("Device reporting an error: " + data.errorState);
@@ -700,6 +774,13 @@ class Plugin(indigo.PluginBase):
         # HA implementation's in-memory auto-off timer without needing
         # Indigo-side scheduling.
         self._dispatch_end_at: dict = {}
+        # inverter device id -> Force Import servo state (target_import_w,
+        # soc_raw, duration_s, power_limit_w, last_power_raw, last_write_time,
+        # near_zero_since). Populated by force_import_action, serviced once
+        # per poll by _service_force_import (called from _poll_inverter),
+        # cleared in _stop_dispatch so every stop path (explicit reset,
+        # duration auto-off, or the servo's own early-stop) tears it down.
+        self._force_import_state: dict = {}
 
     def startup(self) -> None:
         """Called once by Indigo when the plugin starts running."""
@@ -748,12 +829,53 @@ class Plugin(indigo.PluginBase):
                     errors_dict["pollInterval"] = f"Poll interval must be at least {MIN_POLL_INTERVAL} seconds."
             except ValueError:
                 errors_dict["pollInterval"] = "Poll interval must be a whole number of seconds."
+            # Same ranges _validate_dispatch_number enforces at Action time (see that
+            # method's docstring for the source) - checked here too so a bad default
+            # is rejected right in this dialog instead of only when an Action actually
+            # uses it. acLimitKw is itself a fixed-option menu, so it needs no range
+            # check - only used here to size the two Power fields' upper bound.
+            try:
+                ac_limit_kw = float(valuesDict.get("acLimitKw", DEFAULT_AC_LIMIT_KW))
+            except (TypeError, ValueError):
+                ac_limit_kw = DEFAULT_AC_LIMIT_KW
+            power_limit_kw = min(DISPATCH_POWER_ABSOLUTE_MAX_KW, ac_limit_kw)
+            self._validate_config_number(errors_dict, valuesDict, "forceChargingPower", "Force Charging Power (kW)", 0.0, power_limit_kw)
+            self._validate_config_number(errors_dict, valuesDict, "forceChargingCutoffSoC", "Force Charging Cutoff SoC (%)", DISPATCH_SOC_MIN, DISPATCH_SOC_MAX)
+            self._validate_config_number(errors_dict, valuesDict, "forceChargingDuration", "Force Charging Duration (min)", DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES)
+            self._validate_config_number(errors_dict, valuesDict, "forceDischargingPower", "Force Discharging Power (kW)", 0.0, power_limit_kw)
+            self._validate_config_number(errors_dict, valuesDict, "forceDischargingCutoffSoC", "Force Discharging Cutoff SoC (%)", DISPATCH_SOC_MIN, DISPATCH_SOC_MAX)
+            self._validate_config_number(errors_dict, valuesDict, "forceDischargingDuration", "Force Discharging Duration (min)", DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES)
+            self._validate_config_number(errors_dict, valuesDict, "forceImportPower", "Force Import Power (kW)", 0.0, power_limit_kw)
+            self._validate_config_number(errors_dict, valuesDict, "forceImportCutoffSoC", "Force Import Cutoff SoC (%)", DISPATCH_SOC_MIN, DISPATCH_SOC_MAX)
+            self._validate_config_number(errors_dict, valuesDict, "forceImportDuration", "Force Import Duration (min)", DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES)
         elif typeId in ("solarDevice", "batteryDevice", "gridDevice"):
             if not valuesDict.get("systemDevice", ""):
                 errors_dict["systemDevice"] = "Please select the AlphaESS Inverter this device belongs to."
         if errors_dict:
             return (False, valuesDict, errors_dict)
         return (True, valuesDict)
+
+    @staticmethod
+    def _validate_config_number(errors_dict: indigo.Dict, valuesDict: indigo.Dict, field_id: str, label: str, min_v: float, max_v: float) -> None:
+        """Validate one numeric Device Edit dialog field is present, numeric, and in range.
+
+        Args:
+            errors_dict (indigo.Dict): The dialog's error dict - mutated in place,
+                setting ``errors_dict[field_id]`` on failure.
+            valuesDict (indigo.Dict): The dialog's current field values.
+            field_id (str): The field's id in Devices.xml.
+            label (str): Human-readable field name for the error message.
+            min_v (float): Minimum valid value, inclusive.
+            max_v (float): Maximum valid value, inclusive.
+        """
+        text = valuesDict.get(field_id, "").strip()
+        try:
+            value = float(text)
+        except ValueError:
+            errors_dict[field_id] = f"{label} must be a number."
+            return
+        if not (min_v <= value <= max_v):
+            errors_dict[field_id] = f"{label} must be between {min_v} and {max_v}."
 
     def deviceUpdated(self, origDev: indigo.Device, newDev: indigo.Device) -> None:
         """Indigo calls this whenever any device's properties or states change.
@@ -873,6 +995,7 @@ class Plugin(indigo.PluginBase):
         self.logger.debug(f"deviceStopComm: {dev.name}")
         self._next_poll_at.pop(dev.id, None)
         self._dispatch_end_at.pop(dev.id, None)
+        self._force_import_state.pop(dev.id, None)
 
     def _get_or_create_child(self, parent_dev: indigo.Device, type_id: str, label: str) -> indigo.Device:
         """Return a parent inverter's Solar/Battery/Grid child device, creating it if missing.
@@ -1106,6 +1229,15 @@ class Plugin(indigo.PluginBase):
             missing = [name for name, ok in (("solar", solar_ok), ("battery", battery_ok), ("grid", grid_ok)) if not ok]
             dev.setErrorStateOnServer(f"Partial read this cycle - {'/'.join(missing)} unavailable (see that device)")
 
+        if dev.id in self._force_import_state:
+            self._service_force_import(
+                dev,
+                grid_ok=grid_ok,
+                grid_power=values.get("gridPower") if grid_ok else None,
+                battery_ok=battery_ok,
+                battery_power=values.get("batteryPower") if battery_ok else None,
+            )
+
     def _open_dispatch_client(self, dev: indigo.Device) -> Optional[tuple]:
         """Connect a Modbus client for a dispatch write against an inverter device.
 
@@ -1158,6 +1290,42 @@ class Plugin(indigo.PluginBase):
                     continue
         return fallback
 
+    def _resolve_power_limit_kw(self, dev: indigo.Device) -> float:
+        """Resolve the inverter's configured AC power limit, in kW.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device.
+
+        Returns:
+            float: The device's ``acLimitKw`` config value, or
+                ``DEFAULT_AC_LIMIT_KW`` if unset/invalid (e.g. on a device
+                created before this field existed, until it's re-saved).
+        """
+        try:
+            return float(dev.pluginProps.get("acLimitKw", DEFAULT_AC_LIMIT_KW))
+        except (TypeError, ValueError):
+            return DEFAULT_AC_LIMIT_KW
+
+    def _validate_dispatch_number(self, dev: indigo.Device, label: str, value: float, min_v: float, max_v: float) -> bool:
+        """Reject an out-of-range dispatch parameter rather than sending it to the inverter.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device (for the log line).
+            label (str): Human-readable field name, e.g. "Force Charging Power (kW)".
+            value (float): The resolved value to check.
+            min_v (float): Minimum valid value, inclusive.
+            max_v (float): Maximum valid value, inclusive.
+
+        Returns:
+            bool: True if ``value`` is within ``[min_v, max_v]``. False (with
+                an error already logged) otherwise - the caller should abort
+                the dispatch write without contacting the inverter.
+        """
+        if min_v <= value <= max_v:
+            return True
+        self.logger.error(f"{dev.name}: {label} of {value} is out of range ({min_v}-{max_v}) - dispatch not sent")
+        return False
+
     def _write_dispatch(self, client: ModbusTcpClient, unit_id: int, *, power_raw: int, mode: int,
                          soc_raw: int, duration_s: int, pv_switch: int = DISPATCH_PV_UNCHANGED) -> None:
         """Write the 11-register Dispatch block (DISPATCH_START_ADDRESS) as one atomic write.
@@ -1184,14 +1352,14 @@ class Plugin(indigo.PluginBase):
 
     def _start_dispatch(self, dev: indigo.Device, *, dispatch_type: str, power_raw: int, mode: int,
                          soc_raw: int, duration_s: int, dispatch_power_w: int,
-                         pv_switch: int = DISPATCH_PV_UNCHANGED) -> None:
+                         pv_switch: int = DISPATCH_PV_UNCHANGED) -> bool:
         """Write a Dispatch command and update the inverter device's dispatch states.
 
-        Shared by force_charging_action/force_discharging_action/dispatch_action.
-        Mutual exclusivity between dispatch types needs no special handling
-        here: the inverter only ever holds one dispatch config on the wire, so
-        starting a new one already supersedes whatever was active before -
-        this just overwrites the tracked state to match.
+        Shared by force_charging_action/force_discharging_action/dispatch_action/
+        force_import_action. Mutual exclusivity between dispatch types needs no
+        special handling here: the inverter only ever holds one dispatch config
+        on the wire, so starting a new one already supersedes whatever was
+        active before - this just overwrites the tracked state to match.
 
         Args:
             dev (indigo.Device): The AlphaESS Inverter device to dispatch on.
@@ -1204,17 +1372,23 @@ class Plugin(indigo.PluginBase):
                 (positive=discharging, negative=charging - same convention as
                 the batteryPower state).
             pv_switch (int): 0=unchanged, 1=PV on, 2=PV off.
+
+        Returns:
+            bool: True if the write succeeded and device states were updated,
+                False on any connection/write failure (already logged) - used
+                by force_import_action to avoid tracking servo state for a
+                dispatch that was never actually established.
         """
         opened = self._open_dispatch_client(dev)
         if opened is None:
-            return
+            return False
         client, unit_id = opened
         try:
             self._write_dispatch(client, unit_id, power_raw=power_raw, mode=mode, soc_raw=soc_raw,
                                   duration_s=duration_s, pv_switch=pv_switch)
         except ModbusException:
             self.logger.exception(f"{dev.name}: error writing dispatch command")
-            return
+            return False
         finally:
             client.close()
 
@@ -1232,6 +1406,7 @@ class Plugin(indigo.PluginBase):
             f"{dev.name}: Dispatch started - type={dispatch_type}, mode={mode_label}, "
             f"power={dispatch_power_w}W, duration={duration_s}s"
         )
+        return True
 
     def _stop_dispatch(self, dev: indigo.Device, *, reason: str) -> None:
         """Write the Dispatch stop command (word 0 = 0) and clear the device's dispatch states.
@@ -1241,6 +1416,7 @@ class Plugin(indigo.PluginBase):
             reason (str): Human-readable reason, logged (e.g. "user requested" or "duration expired").
         """
         self._dispatch_end_at.pop(dev.id, None)
+        self._force_import_state.pop(dev.id, None)
         opened = self._open_dispatch_client(dev)
         if opened is None:
             return
@@ -1264,6 +1440,87 @@ class Plugin(indigo.PluginBase):
             {"key": "dispatchEndsAt", "value": ""},
         ])
 
+    def _service_force_import(self, dev: indigo.Device, *, grid_ok: bool, grid_power: Optional[float],
+                               battery_ok: bool, battery_power: Optional[float]) -> None:
+        """Servo the Force Import setpoint and auto-stop early once the target's reached.
+
+        Called once per poll cycle (from the end of _poll_inverter) for any
+        inverter with an active Force Import tracked in self._force_import_state.
+        Two independent checks, mirroring senalse/ha-alphaess-modbus's switch.py
+        exactly (see the FORCE_IMPORT_* constants' comment for the cadence
+        difference from HA's ~2s coordinator loop):
+
+        1. Early stop - checked first, since there's no point servoing a
+           setpoint about to be zeroed. If batteryPower has stayed within
+           +-FORCE_IMPORT_NEAR_ZERO_BAND_W for FORCE_IMPORT_NEAR_ZERO_HOLD_S,
+           the inverter's own SoC Control loop has already reached the cutoff
+           and settled - stop now rather than waiting out the full duration.
+        2. Grid-error servo - trims the charge word so measured grid power
+           converges on the configured import target (the initial feed-forward
+           estimate alone drifts: battery efficiency, sudden load changes).
+           Proportional control only, rewriting just often enough to matter
+           (FORCE_IMPORT_SERVO_DEADBAND_W moved, or FORCE_IMPORT_STALE_REWRITE_S
+           elapsed) rather than every poll.
+
+        Args:
+            dev (indigo.Device): The AlphaESS Inverter device.
+            grid_ok (bool): Whether this poll's grid cluster read succeeded.
+            grid_power (Optional[float]): This poll's gridPower reading, if grid_ok.
+            battery_ok (bool): Whether this poll's battery cluster read succeeded.
+            battery_power (Optional[float]): This poll's batteryPower reading, if battery_ok.
+        """
+        state = self._force_import_state.get(dev.id)
+        if state is None:
+            return
+
+        if battery_ok and battery_power is not None:
+            now = time.time()
+            if abs(battery_power) <= FORCE_IMPORT_NEAR_ZERO_BAND_W:
+                if state["near_zero_since"] is None:
+                    state["near_zero_since"] = now
+                elif now - state["near_zero_since"] >= FORCE_IMPORT_NEAR_ZERO_HOLD_S:
+                    self._stop_dispatch(dev, reason="Force Import target reached")
+                    return
+            else:
+                state["near_zero_since"] = None
+
+        if not grid_ok or grid_power is None:
+            return
+
+        error_w = state["target_import_w"] - float(grid_power)
+        new_charge_w = (32000 - state["last_power_raw"]) + FORCE_IMPORT_SERVO_GAIN * error_w
+        new_charge_w = max(0.0, min(state["power_limit_w"], new_charge_w))
+        word = int(round(32000 - new_charge_w))
+
+        now = time.time()
+        changed = abs(word - state["last_power_raw"]) >= FORCE_IMPORT_SERVO_DEADBAND_W
+        stale = (now - state["last_write_time"]) >= FORCE_IMPORT_STALE_REWRITE_S
+        if not (changed or stale):
+            return
+
+        opened = self._open_dispatch_client(dev)
+        if opened is None:
+            return
+        client, unit_id = opened
+        try:
+            self._write_dispatch(
+                client, unit_id, power_raw=word, mode=DISPATCH_MODE_SOC_CONTROL,
+                soc_raw=state["soc_raw"], duration_s=state["duration_s"],
+            )
+        except ModbusException:
+            self.logger.exception(f"{dev.name}: error servoing Force Import setpoint")
+            return
+        finally:
+            client.close()
+
+        state["last_power_raw"] = word
+        state["last_write_time"] = now
+        dev.updateStatesOnServer([{"key": "dispatchPowerTarget", "value": -int(new_charge_w)}])
+        self.logger.debug(
+            f"{dev.name}: Force Import servo - grid={grid_power:.0f}W target={state['target_import_w']:.0f}W "
+            f"error={error_w:.0f}W -> charge={new_charge_w:.0f}W"
+        )
+
     def force_charging_action(self, pluginAction: indigo.PluginAction) -> None:
         """Actions.xml callback for Force Charging.
 
@@ -1279,6 +1536,13 @@ class Plugin(indigo.PluginBase):
         power_kw = self._resolve_number(pluginAction.props.get("power"), dev.pluginProps.get("forceChargingPower"), 5.0)
         cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), dev.pluginProps.get("forceChargingCutoffSoC"), 100.0)
         duration_min = self._resolve_number(pluginAction.props.get("duration"), dev.pluginProps.get("forceChargingDuration"), 120.0)
+        power_limit_kw = min(DISPATCH_POWER_ABSOLUTE_MAX_KW, self._resolve_power_limit_kw(dev))
+        if not self._validate_dispatch_number(dev, "Force Charging Power (kW)", power_kw, 0.0, power_limit_kw):
+            return
+        if not self._validate_dispatch_number(dev, "Force Charging Cutoff SoC (%)", cutoff_soc, DISPATCH_SOC_MIN, DISPATCH_SOC_MAX):
+            return
+        if not self._validate_dispatch_number(dev, "Force Charging Duration (min)", duration_min, DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES):
+            return
         duration_s = int(duration_min * 60)
         if duration_s <= 0:
             self.logger.error(f"{dev.name}: Force Charging duration must be greater than 0")
@@ -1305,6 +1569,13 @@ class Plugin(indigo.PluginBase):
         power_kw = self._resolve_number(pluginAction.props.get("power"), dev.pluginProps.get("forceDischargingPower"), 5.0)
         cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), dev.pluginProps.get("forceDischargingCutoffSoC"), 20.0)
         duration_min = self._resolve_number(pluginAction.props.get("duration"), dev.pluginProps.get("forceDischargingDuration"), 120.0)
+        power_limit_kw = min(DISPATCH_POWER_ABSOLUTE_MAX_KW, self._resolve_power_limit_kw(dev))
+        if not self._validate_dispatch_number(dev, "Force Discharging Power (kW)", power_kw, 0.0, power_limit_kw):
+            return
+        if not self._validate_dispatch_number(dev, "Force Discharging Cutoff SoC (%)", cutoff_soc, DISPATCH_SOC_MIN, DISPATCH_SOC_MAX):
+            return
+        if not self._validate_dispatch_number(dev, "Force Discharging Duration (min)", duration_min, DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES):
+            return
         duration_s = int(duration_min * 60)
         if duration_s <= 0:
             self.logger.error(f"{dev.name}: Force Discharging duration must be greater than 0")
@@ -1315,6 +1586,74 @@ class Plugin(indigo.PluginBase):
             dev, dispatch_type="forceDischarging", power_raw=power_raw, mode=DISPATCH_MODE_SOC_CONTROL,
             soc_raw=soc_raw, duration_s=duration_s, dispatch_power_w=int(power_kw * 1000),
         )
+
+    def force_import_action(self, pluginAction: indigo.PluginAction) -> None:
+        """Actions.xml callback for Force Import.
+
+        Unlike Force Charging/Discharging/generic Dispatch (a single
+        fire-and-forget write), Force Import needs a standing servo loop: the
+        dispatch block only accepts a fixed charge-power word, but the actual
+        goal is a fixed *grid import* level, and house load/PV shift
+        constantly. This writes an initial feed-forward estimate -
+        ``charge = target_import - house_load + pv`` (floored at 0), matching
+        senalse/ha-alphaess-modbus's switch.py's ``_compute_force_import_power_raw``
+        exactly - then hands off to ``_service_force_import`` (called once per
+        poll from ``_poll_inverter``) to correct the setpoint against the
+        actual measured grid power and to stop early once the battery settles
+        (the inverter's own SoC Control loop has reached the cutoff).
+
+        Args:
+            pluginAction (indigo.PluginAction): The action instance, including
+                ``deviceId`` and any per-call field overrides in ``props``.
+        """
+        dev = indigo.devices[pluginAction.deviceId]
+        import_power_kw = self._resolve_number(pluginAction.props.get("power"), dev.pluginProps.get("forceImportPower"), 5.0)
+        cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), dev.pluginProps.get("forceImportCutoffSoC"), 90.0)
+        duration_min = self._resolve_number(pluginAction.props.get("duration"), dev.pluginProps.get("forceImportDuration"), 120.0)
+        power_limit_kw = min(DISPATCH_POWER_ABSOLUTE_MAX_KW, self._resolve_power_limit_kw(dev))
+        if not self._validate_dispatch_number(dev, "Force Import Power (kW)", import_power_kw, 0.0, power_limit_kw):
+            return
+        if not self._validate_dispatch_number(dev, "Force Import Cutoff SoC (%)", cutoff_soc, DISPATCH_SOC_MIN, DISPATCH_SOC_MAX):
+            return
+        if not self._validate_dispatch_number(dev, "Force Import Duration (min)", duration_min, DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES):
+            return
+        duration_s = int(duration_min * 60)
+        if duration_s <= 0:
+            self.logger.error(f"{dev.name}: Force Import duration must be greater than 0")
+            return
+
+        target_import_w = import_power_kw * 1000
+        power_limit_w = power_limit_kw * 1000
+        soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
+
+        # Feed-forward seed: accurate at turn-on, before the battery is
+        # dispatching - the servo takes over from the next poll. Falls back to
+        # "assume charge == target" if there's no cached reading yet (e.g. a
+        # brand-new device); the servo corrects it from the next poll either way.
+        solar_dev = self._find_child(dev.id, "solarDevice")
+        pv_power = solar_dev.states.get("pvPower") if solar_dev else None
+        load_power = dev.states.get("loadPower")
+        if pv_power is not None and load_power is not None:
+            charge_w = max(0.0, target_import_w - float(load_power) + float(pv_power))
+        else:
+            charge_w = target_import_w
+        power_raw = int(32000 - charge_w)
+
+        started = self._start_dispatch(
+            dev, dispatch_type="forceImport", power_raw=power_raw, mode=DISPATCH_MODE_SOC_CONTROL,
+            soc_raw=soc_raw, duration_s=duration_s, dispatch_power_w=int(-charge_w),
+        )
+        if not started:
+            return
+        self._force_import_state[dev.id] = {
+            "target_import_w": target_import_w,
+            "soc_raw": soc_raw,
+            "duration_s": duration_s,
+            "power_limit_w": power_limit_w,
+            "last_power_raw": power_raw,
+            "last_write_time": time.time(),
+            "near_zero_since": None,
+        }
 
     def dispatch_action(self, pluginAction: indigo.PluginAction) -> None:
         """Actions.xml callback for the generic Dispatch action (all 8 modes).
@@ -1338,6 +1677,8 @@ class Plugin(indigo.PluginBase):
         power_kw = self._resolve_number(pluginAction.props.get("power"), None, 0.0)
         cutoff_soc = self._resolve_number(pluginAction.props.get("cutoffSoC"), None, 100.0)
         duration_min = self._resolve_number(pluginAction.props.get("duration"), None, 120.0)
+        if not self._validate_dispatch_number(dev, "Dispatch Duration (min)", duration_min, DISPATCH_DURATION_MIN_MINUTES, DISPATCH_DURATION_MAX_MINUTES):
+            return
         duration_s = int(duration_min * 60)
         if duration_s <= 0:
             self.logger.error(f"{dev.name}: Dispatch duration must be greater than 0")
@@ -1348,12 +1689,24 @@ class Plugin(indigo.PluginBase):
             pv_switch = DISPATCH_PV_UNCHANGED
 
         if mode in (1, 2, 3, 5):
+            # Power only applies in these modes (see the module-level DISPATCH_MODE_LABELS
+            # comment) - only validated here, not for the algorithm-driven modes below,
+            # where a leftover/default power value is never actually sent.
+            power_limit_kw = min(DISPATCH_POWER_ABSOLUTE_MAX_KW, self._resolve_power_limit_kw(dev))
+            if not self._validate_dispatch_number(dev, "Dispatch Power (kW)", power_kw, -power_limit_kw, power_limit_kw):
+                return
             power_raw = int(32000 + power_kw * 1000)
             dispatch_power_w = int(power_kw * 1000)
         else:
             power_raw = 32000
             dispatch_power_w = 0
-        soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE) if mode == DISPATCH_MODE_SOC_CONTROL else 0
+        if mode == DISPATCH_MODE_SOC_CONTROL:
+            # SoC target only applies in this mode - same reasoning as Power above.
+            if not self._validate_dispatch_number(dev, "Dispatch Cutoff SoC (%)", cutoff_soc, DISPATCH_SOC_MIN, DISPATCH_SOC_MAX):
+                return
+            soc_raw = int(cutoff_soc / DISPATCH_SOC_SCALE)
+        else:
+            soc_raw = 0
 
         self._start_dispatch(
             dev, dispatch_type="dispatch", power_raw=power_raw, mode=mode, soc_raw=soc_raw,
