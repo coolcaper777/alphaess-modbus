@@ -245,6 +245,35 @@ FORCE_IMPORT_STALE_REWRITE_S = 60
 FORCE_IMPORT_NEAR_ZERO_BAND_W = 50
 FORCE_IMPORT_NEAR_ZERO_HOLD_S = 10
 
+# Pause/Resume safety mechanism, ported from Hillview Lodge's
+# integration_alpha_ess.yaml (AlphaESS_Force_Import_Pause/_Resume, read in
+# full before implementing) - a real gap senalse/ha-alphaess-modbus's version
+# doesn't have at all. Pauses (writes a neutral dispatch, but keeps Force
+# Import logically active - see _service_force_import) if the target can't
+# actually be met without draining the battery, if PV production is clipping
+# against the inverter's AC limit, or if the inverter leaves Normal work mode
+# at all (e.g. a grid-outage Bypass/EPS event - that condition in the source
+# reads like it came from a real incident). Only resumes once work mode has
+# been confirmed Normal for a full 10 minutes AND the overload has cleared -
+# deliberately conservative, not a quick bounce-back.
+FORCE_IMPORT_OVERLOAD_HOLD_S = 5
+FORCE_IMPORT_RESUME_NORMAL_HOLD_S = 600
+# Every one of the *_HOLD_S constants above is a wall-clock duration, but this
+# plugin only samples once per poll (pollInterval, user-configurable 10-300s)
+# - unlike HA's ~2s coordinator tick, which is fast enough that a single poll
+# gap is never a concern. Checking elapsed time alone breaks down for a slow
+# poller: if pollInterval is 300s and a HOLD_S of 10 is checked purely by
+# wall-clock, the *very first* observation already satisfies "10 seconds have
+# elapsed since I started tracking this" as soon as a second poll arrives -
+# nothing was actually confirmed "sustained," just two samples 300s apart
+# that both happened to qualify. _track_sustained (used by all three HOLD_S
+# checks below) additionally requires this many consecutive qualifying polls,
+# regardless of how much wall-clock time that represents - the honest
+# statement of what a slow poller can actually confirm, rather than a
+# threshold whose real meaning silently depends on a poll rate nobody chose
+# with this constant in mind.
+FORCE_IMPORT_MIN_SUSTAINED_POLLS = 2
+
 PV_STRINGS = range(1, 7)
 # Not 1053 - widened by 1 register to also cover gridFrequency at 1052 (see
 # the REGISTERS comment above for why that value lives in this cluster).
@@ -1204,14 +1233,16 @@ class Plugin(indigo.PluginBase):
             solar_dev.setErrorStateOnServer(cluster_errors.get(SOLAR_CLUSTER_START, "Modbus read error"))
 
         inverter_states = []
+        work_mode = int(values["invWorkMode"]) if solar_ok else None
         if solar_ok:
             inverter_states.append({"key": "invTemperature", "value": values["invTemperature"], "decimalPlaces": 1})
             inverter_states.append({
                 "key": "invWorkMode",
-                "value": INVERTER_WORK_MODE_LABELS.get(int(values["invWorkMode"]), f"Unknown work mode ({int(values['invWorkMode'])})"),
+                "value": INVERTER_WORK_MODE_LABELS.get(work_mode, f"Unknown work mode ({work_mode})"),
             })
         if time_ok:
             inverter_states.append({"key": "systemTime", "value": _decode_system_time(cluster_registers[SYSTEM_TIME_CLUSTER_START])})
+        load_power = None
         if grid_ok and battery_ok and solar_ok:
             # Matches the Hillview integration's "house load" formula: PV +
             # battery output + grid import all flow into the house, whichever
@@ -1236,6 +1267,10 @@ class Plugin(indigo.PluginBase):
                 grid_power=values.get("gridPower") if grid_ok else None,
                 battery_ok=battery_ok,
                 battery_power=values.get("batteryPower") if battery_ok else None,
+                solar_ok=solar_ok,
+                work_mode=work_mode,
+                pv_power=pv_power,
+                load_power=load_power,
             )
 
     def _open_dispatch_client(self, dev: indigo.Device) -> Optional[tuple]:
@@ -1440,27 +1475,84 @@ class Plugin(indigo.PluginBase):
             {"key": "dispatchEndsAt", "value": ""},
         ])
 
+    @staticmethod
+    def _track_sustained(state: dict, since_key: str, count_key: str, condition_now: bool,
+                          hold_s: float, min_polls: int = FORCE_IMPORT_MIN_SUSTAINED_POLLS) -> bool:
+        """Track whether a condition has held across polls, resetting whenever it goes false.
+
+        Requires BOTH ``hold_s`` of elapsed wall-clock time AND ``min_polls``
+        consecutive qualifying polls - see the FORCE_IMPORT_MIN_SUSTAINED_POLLS
+        comment for why elapsed time alone isn't a meaningful "sustained" check
+        when pollInterval can be longer than hold_s.
+
+        Args:
+            state (dict): The tracking dict to read/update (e.g. one inverter's
+                entry in self._force_import_state).
+            since_key (str): Key holding the epoch time the condition first
+                became true (None if not currently tracking).
+            count_key (str): Key holding the number of consecutive polls the
+                condition has been true.
+            condition_now (bool): Whether the condition is true this poll.
+            hold_s (float): Minimum elapsed wall-clock time required.
+            min_polls (int): Minimum consecutive qualifying polls required.
+
+        Returns:
+            bool: True once both thresholds are satisfied.
+        """
+        if not condition_now:
+            state[since_key] = None
+            state[count_key] = 0
+            return False
+        now = time.time()
+        if state[since_key] is None:
+            state[since_key] = now
+            state[count_key] = 1
+            return False
+        state[count_key] += 1
+        return (now - state[since_key] >= hold_s) and (state[count_key] >= min_polls)
+
     def _service_force_import(self, dev: indigo.Device, *, grid_ok: bool, grid_power: Optional[float],
-                               battery_ok: bool, battery_power: Optional[float]) -> None:
-        """Servo the Force Import setpoint and auto-stop early once the target's reached.
+                               battery_ok: bool, battery_power: Optional[float], solar_ok: bool,
+                               work_mode: Optional[int], pv_power: Optional[float],
+                               load_power: Optional[float]) -> None:
+        """Servo the Force Import setpoint, pause/resume around unsafe conditions, and
+        auto-stop early once the target's reached.
 
         Called once per poll cycle (from the end of _poll_inverter) for any
         inverter with an active Force Import tracked in self._force_import_state.
-        Two independent checks, mirroring senalse/ha-alphaess-modbus's switch.py
-        exactly (see the FORCE_IMPORT_* constants' comment for the cadence
-        difference from HA's ~2s coordinator loop):
 
-        1. Early stop - checked first, since there's no point servoing a
-           setpoint about to be zeroed. If batteryPower has stayed within
-           +-FORCE_IMPORT_NEAR_ZERO_BAND_W for FORCE_IMPORT_NEAR_ZERO_HOLD_S,
-           the inverter's own SoC Control loop has already reached the cutoff
-           and settled - stop now rather than waiting out the full duration.
-        2. Grid-error servo - trims the charge word so measured grid power
-           converges on the configured import target (the initial feed-forward
-           estimate alone drifts: battery efficiency, sudden load changes).
-           Proportional control only, rewriting just often enough to matter
-           (FORCE_IMPORT_SERVO_DEADBAND_W moved, or FORCE_IMPORT_STALE_REWRITE_S
-           elapsed) rather than every poll.
+        While NOT paused, checks (in order):
+
+        1. Pause conditions - ported from Hillview Lodge's integration_alpha_ess.yaml
+           (AlphaESS_Force_Import_Pause), ANDed/ORed exactly as that source does:
+           the target can't actually be met without draining the battery
+           (``load - PV > target_import``, sustained via _track_sustained -
+           this is the only one of the three with a hold requirement in the
+           source), OR PV production is clipping against the AC limit
+           (instantaneous), OR the inverter has left Normal work mode at all
+           (instantaneous - covers a grid-outage Bypass/EPS event). If
+           triggered, writes a neutral dispatch (word 0/Start=0, matching
+           Hillview's exact register values including its own 90s duration -
+           preserved as observed rather than guessed at, since it's unclear
+           whether that value is even interpreted when Start=0) and marks the
+           session paused rather than stopped: the overall duration/auto-off
+           keeps counting down regardless, matching the source.
+        2. Early stop - if batteryPower has stayed within
+           +-FORCE_IMPORT_NEAR_ZERO_BAND_W for FORCE_IMPORT_NEAR_ZERO_HOLD_S
+           (also via _track_sustained), the inverter's own SoC Control loop
+           has already reached the cutoff and settled - stop now rather than
+           waiting out the full duration.
+        3. Grid-error servo - trims the charge word so measured grid power
+           converges on the configured import target. Proportional control
+           only, rewriting just often enough to matter.
+
+        While paused, checks the resume gate instead: work mode confirmed
+        Normal for a full FORCE_IMPORT_RESUME_NORMAL_HOLD_S (10 minutes, via
+        _track_sustained) AND the overload/clipping conditions have cleared
+        (both instantaneous, matching the source). Once resumed, clears the
+        pause tracking and falls through into the normal checks above using
+        this same poll's data, so correction resumes immediately rather than
+        waiting a further cycle.
 
         Args:
             dev (indigo.Device): The AlphaESS Inverter device.
@@ -1468,21 +1560,85 @@ class Plugin(indigo.PluginBase):
             grid_power (Optional[float]): This poll's gridPower reading, if grid_ok.
             battery_ok (bool): Whether this poll's battery cluster read succeeded.
             battery_power (Optional[float]): This poll's batteryPower reading, if battery_ok.
+            solar_ok (bool): Whether this poll's solar/inverter-health cluster read succeeded
+                (invWorkMode lives in this cluster).
+            work_mode (Optional[int]): This poll's raw invWorkMode code, if solar_ok
+                (1 = Normal - see INVERTER_WORK_MODE_LABELS).
+            pv_power (Optional[float]): This poll's summed PV power, if solar_ok.
+            load_power (Optional[float]): This poll's computed house load, if
+                grid_ok/battery_ok/solar_ok all succeeded this cycle.
         """
         state = self._force_import_state.get(dev.id)
         if state is None:
             return
 
-        if battery_ok and battery_power is not None:
-            now = time.time()
-            if abs(battery_power) <= FORCE_IMPORT_NEAR_ZERO_BAND_W:
-                if state["near_zero_since"] is None:
-                    state["near_zero_since"] = now
-                elif now - state["near_zero_since"] >= FORCE_IMPORT_NEAR_ZERO_HOLD_S:
-                    self._stop_dispatch(dev, reason="Force Import target reached")
+        if state["paused"]:
+            if solar_ok and work_mode is not None and pv_power is not None and load_power is not None:
+                normal_sustained = self._track_sustained(
+                    state, "normal_since", "normal_count", work_mode == 1, FORCE_IMPORT_RESUME_NORMAL_HOLD_S,
+                )
+                overload_cleared = (load_power - pv_power) < state["target_import_w"]
+                not_clipping = pv_power < state["power_limit_w"]
+                if normal_sustained and overload_cleared and not_clipping:
+                    state["paused"] = False
+                    state["near_zero_since"] = None
+                    state["near_zero_count"] = 0
+                    self.logger.info(f"{dev.name}: Force Import resumed - work mode Normal, overload cleared")
+                    # Fall through into the normal checks below using this same
+                    # poll's data, rather than waiting a further cycle.
+                else:
                     return
             else:
-                state["near_zero_since"] = None
+                # Can't evaluate the resume gate without a fresh work
+                # mode/PV/load reading this cycle - stay paused, try again
+                # next poll rather than resuming on stale/missing data.
+                return
+
+        if not state["paused"] and solar_ok and pv_power is not None:
+            overload_now = load_power is not None and (load_power - pv_power) > state["target_import_w"]
+            overload_sustained = self._track_sustained(
+                state, "overload_since", "overload_count", overload_now, FORCE_IMPORT_OVERLOAD_HOLD_S,
+            )
+            clipping = pv_power >= state["power_limit_w"]
+            not_normal = work_mode is not None and work_mode != 1
+            if overload_sustained or clipping or not_normal:
+                reason = (
+                    "inverter not in Normal work mode" if not_normal
+                    else "PV output clipping against AC limit" if clipping
+                    else "target unreachable without draining the battery"
+                )
+                opened = self._open_dispatch_client(dev)
+                if opened is not None:
+                    client, unit_id = opened
+                    try:
+                        result = client.write_registers(
+                            DISPATCH_START_ADDRESS,
+                            [0, 0, 32000, 0, 32000, 0, 0, 0, 90, DISPATCH_FLOW_DIRECTION, DISPATCH_PV_UNCHANGED],
+                            device_id=unit_id,
+                        )
+                        if result.isError():
+                            raise ModbusException(f"error writing dispatch pause: {result}")
+                        state["paused"] = True
+                        state["last_power_raw"] = 32000
+                        state["last_write_time"] = time.time()
+                        state["near_zero_since"] = None
+                        state["near_zero_count"] = 0
+                        self.logger.warning(f"{dev.name}: Force Import paused - {reason}")
+                        dev.updateStatesOnServer([{"key": "dispatchModeLabel", "value": f"Force Import - Paused ({reason})"}])
+                    except ModbusException:
+                        self.logger.exception(f"{dev.name}: error pausing Force Import")
+                    finally:
+                        client.close()
+                return
+
+        if battery_ok and battery_power is not None:
+            near_zero_reached = self._track_sustained(
+                state, "near_zero_since", "near_zero_count",
+                abs(battery_power) <= FORCE_IMPORT_NEAR_ZERO_BAND_W, FORCE_IMPORT_NEAR_ZERO_HOLD_S,
+            )
+            if near_zero_reached:
+                self._stop_dispatch(dev, reason="Force Import target reached")
+                return
 
         if not grid_ok or grid_power is None:
             return
@@ -1515,7 +1671,10 @@ class Plugin(indigo.PluginBase):
 
         state["last_power_raw"] = word
         state["last_write_time"] = now
-        dev.updateStatesOnServer([{"key": "dispatchPowerTarget", "value": -int(new_charge_w)}])
+        dev.updateStatesOnServer([
+            {"key": "dispatchPowerTarget", "value": -int(new_charge_w)},
+            {"key": "dispatchModeLabel", "value": DISPATCH_MODE_LABELS.get(DISPATCH_MODE_SOC_CONTROL, "State of Charge Control")},
+        ])
         self.logger.debug(
             f"{dev.name}: Force Import servo - grid={grid_power:.0f}W target={state['target_import_w']:.0f}W "
             f"error={error_w:.0f}W -> charge={new_charge_w:.0f}W"
@@ -1653,6 +1812,12 @@ class Plugin(indigo.PluginBase):
             "last_power_raw": power_raw,
             "last_write_time": time.time(),
             "near_zero_since": None,
+            "near_zero_count": 0,
+            "paused": False,
+            "overload_since": None,
+            "overload_count": 0,
+            "normal_since": None,
+            "normal_count": 0,
         }
 
     def dispatch_action(self, pluginAction: indigo.PluginAction) -> None:
