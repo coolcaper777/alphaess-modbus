@@ -120,7 +120,9 @@ A running dispatch auto-stops on its own once its duration elapses — no separa
 
 ## Debug logging
 
-Plugin → Configure → **Enable Debug Logging** logs every Modbus register read/decode for each inverter in detail. It can be toggled live without restarting the plugin. Turn it on when a value looks wrong — the logged raw register values show exactly what the inverter returned before decoding.
+Plugin → Configure → **Enable Debug Logging** logs every Modbus register read/decode for each inverter in detail, plus a one-line-per-poll `snapshot` summary (work mode, dispatch mode, SoC, battery/grid/PV/load power) — grep the Indigo log for "snapshot" to get a clean trace of what the inverter was actually doing over time, without wading through the raw per-register lines. It can be toggled live without restarting the plugin. Turn it on when a value looks wrong, or when reconstructing a dispatch/Force Import episode after the fact.
+
+Dispatch start (in the Event Log, without needing debug on) always includes the Cutoff SoC that was actually sent, not just power/mode/duration — useful since a dispatch's behavior around its cutoff (not just its power/mode) is often the thing worth checking. Force Import's pause/resume log lines likewise include the PV/load/battery figures at that moment, not just the reason.
 
 ## Troubleshooting
 

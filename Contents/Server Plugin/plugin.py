@@ -1260,6 +1260,24 @@ class Plugin(indigo.PluginBase):
             missing = [name for name, ok in (("solar", solar_ok), ("battery", battery_ok), ("grid", grid_ok)) if not ok]
             dev.setErrorStateOnServer(f"Partial read this cycle - {'/'.join(missing)} unavailable (see that device)")
 
+        # One consolidated line per poll with every figure that mattered for
+        # reconstructing dispatch behaviour after the fact when troubleshooting
+        # against Home Assistant's history/logbook (2026-08-31/09-01) - grep the
+        # Indigo log for "snapshot" with debug logging on for the same kind of
+        # grid/battery/PV/load/SoC/mode trace that investigation needed, instead
+        # of wading through the raw per-register dump above.
+        mode_txt = INVERTER_WORK_MODE_LABELS.get(work_mode, f"Unknown ({work_mode})") if work_mode is not None else "?"
+        soc_txt = f"{values['batterySoC']:.1f}%" if battery_ok else "?"
+        batt_txt = f"{values['batteryPower']:.0f}W" if battery_ok else "?"
+        grid_txt = f"{values['gridPower']:.0f}W" if grid_ok else "?"
+        pv_txt = f"{pv_power:.0f}W" if pv_power is not None else "?"
+        load_txt = f"{load_power:.0f}W" if load_power is not None else "?"
+        dispatch_txt = dev.states.get("dispatchModeLabel") or "none"
+        self.logger.debug(
+            f"{dev.name}: snapshot - workMode={mode_txt} dispatch={dispatch_txt} "
+            f"SoC={soc_txt} battery={batt_txt} grid={grid_txt} pv={pv_txt} load={load_txt}"
+        )
+
         if dev.id in self._force_import_state:
             self._service_force_import(
                 dev,
@@ -1437,9 +1455,10 @@ class Plugin(indigo.PluginBase):
             {"key": "dispatchPowerTarget", "value": dispatch_power_w},
             {"key": "dispatchEndsAt", "value": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_at))},
         ])
+        cutoff_txt = f"{soc_raw * DISPATCH_SOC_SCALE:.1f}% (raw soc={soc_raw})" if mode == DISPATCH_MODE_SOC_CONTROL else "n/a for this mode"
         self.logger.info(
             f"{dev.name}: Dispatch started - type={dispatch_type}, mode={mode_label}, "
-            f"power={dispatch_power_w}W, duration={duration_s}s"
+            f"power={dispatch_power_w}W, cutoffSoC={cutoff_txt}, duration={duration_s}s"
         )
         return True
 
@@ -1583,7 +1602,10 @@ class Plugin(indigo.PluginBase):
                     state["paused"] = False
                     state["near_zero_since"] = None
                     state["near_zero_count"] = 0
-                    self.logger.info(f"{dev.name}: Force Import resumed - work mode Normal, overload cleared")
+                    self.logger.info(
+                        f"{dev.name}: Force Import resumed - work mode Normal, overload cleared "
+                        f"(pv={pv_power:.0f}W load={load_power:.0f}W target={state['target_import_w']:.0f}W)"
+                    )
                     # Fall through into the normal checks below using this same
                     # poll's data, rather than waiting a further cycle.
                 else:
@@ -1623,7 +1645,13 @@ class Plugin(indigo.PluginBase):
                         state["last_write_time"] = time.time()
                         state["near_zero_since"] = None
                         state["near_zero_count"] = 0
-                        self.logger.warning(f"{dev.name}: Force Import paused - {reason}")
+                        pv_txt = f"{pv_power:.0f}W" if pv_power is not None else "?"
+                        load_txt = f"{load_power:.0f}W" if load_power is not None else "?"
+                        batt_txt = f"{battery_power:.0f}W" if battery_ok and battery_power is not None else "?"
+                        self.logger.warning(
+                            f"{dev.name}: Force Import paused - {reason} "
+                            f"(pv={pv_txt} load={load_txt} battery={batt_txt} target={state['target_import_w']:.0f}W)"
+                        )
                         dev.updateStatesOnServer([{"key": "dispatchModeLabel", "value": f"Force Import - Paused ({reason})"}])
                     except ModbusException:
                         self.logger.exception(f"{dev.name}: error pausing Force Import")
