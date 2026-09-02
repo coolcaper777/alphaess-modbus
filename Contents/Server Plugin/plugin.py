@@ -70,7 +70,22 @@ INVERTER_CONFIG_FIELD_LABELS = {
 #   10   : PV Switch (0=unchanged, 1=on, 2=off) - only takes effect during an
 #          active dispatch
 DISPATCH_START_ADDRESS = 0x0880
-DISPATCH_SOC_SCALE = 0.392
+# Corrected 2026-09-02 from 0.392 to 0.4 (raw = percent / 0.4, i.e. percent *
+# 2.5) - the 0.392 value was carried forward from senalse/ha-alphaess-modbus
+# (present unexplained since that project's very first commit, no rationale
+# found in its history or in Hillview Lodge's page) without ever being
+# checked against AlphaESS's own documentation. Two independent official
+# AlphaESS sources agree on 0.4: the Household Modbus Register Parameter
+# List's own worked example ("Send SOC=95, corresponding to the SOC of 38%"
+# - 95 x 0.4 = 38) and the Modbus/Sever API Guide's explicit formula
+# ("Para3 = SOC / 0.4"). With 0.392, a 90% cutoff request was actually being
+# encoded as ~91.6% once decoded back - a small but real and entirely
+# avoidable error. Not yet independently confirmed by a live test against
+# this specific inverter's actual dispatch-stop behaviour (the official docs
+# were considered authoritative enough on their own here, given the ~1.8%
+# relative error the worked example above shows and the complete lack of
+# any rationale for 0.392 anywhere).
+DISPATCH_SOC_SCALE = 0.4
 DISPATCH_MODE_SOC_CONTROL = 2
 DISPATCH_FLOW_DIRECTION = 255
 DISPATCH_PV_UNCHANGED = 0
@@ -970,6 +985,20 @@ def _decode_system_time(registers: list) -> str:
     day, hour = day_hour >> 8, day_hour & 0xFF
     minute, second = minute_second >> 8, minute_second & 0xFF
     return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+
+
+class _MenuPluginAction:
+    """Minimal stand-in for indigo.PluginAction, for MenuItems.xml callbacks
+    that call an existing Actions.xml callback directly with no per-call
+    field overrides. Supplies just the two attributes those callbacks read -
+    deviceId and an empty props dict - so every one of that Action's own
+    overridable fields resolves straight through to the device's configured
+    defaults, exactly as if a real Action Group step had left them all blank.
+    """
+
+    def __init__(self, device_id: int):
+        self.deviceId = device_id
+        self.props: dict = {}
 
 
 class Plugin(indigo.PluginBase):
@@ -2168,6 +2197,105 @@ class Plugin(indigo.PluginBase):
         """
         dev = indigo.devices[pluginAction.deviceId]
         self._stop_dispatch(dev, reason="user requested")
+
+    def _resolve_single_inverter(self, menu_label: str) -> Optional[indigo.Device]:
+        """Resolve the one AlphaESS Inverter device for a bare Plugins-menu item.
+
+        Shared by every menu item that acts on a device with no picker of its
+        own (unlike an Action Group step, which always specifies a device).
+        Only succeeds when exactly one Inverter device exists - with zero or
+        multiple, there's no context to disambiguate from a bare menu click,
+        so this logs an error and returns None rather than guessing which
+        device was meant. A multi-inverter install always has the equivalent
+        Action-Group version of each of these, with its own device picker.
+
+        Args:
+            menu_label (str): The menu item's own name, used in the error message.
+
+        Returns:
+            Optional[indigo.Device]: The single Inverter device, or None if
+                zero or more than one exists (already logged).
+        """
+        inverters = list(indigo.devices.iter("self.inverter"))
+        if len(inverters) != 1:
+            self.logger.error(
+                f"{menu_label} menu item needs exactly one AlphaESS Inverter device configured "
+                f"(found {len(inverters)}) - use the equivalent Action in an Action Group instead, "
+                f"which lets you pick the device."
+            )
+            return None
+        return inverters[0]
+
+    def dispatch_reset_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Dispatch Reset (Stop)" item.
+
+        Deliberately has no ConfigUI/device picker, unlike dispatch_reset_action -
+        the point is a one-click stop for the common single-inverter install
+        without a dialog in the way.
+        """
+        dev = self._resolve_single_inverter("Dispatch Reset (Stop)")
+        if dev is None:
+            return
+        self._stop_dispatch(dev, reason="user requested (menu)")
+
+    def poll_now_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Poll Now" item.
+
+        Reads a fresh set of registers immediately, without waiting for the
+        device's own configured pollInterval to elapse. Purely additive -
+        _next_poll_at (runConcurrentThread's own schedule) is only ever
+        touched inside that loop, never inside _poll_inverter itself, so
+        calling it directly here doesn't disturb or reset the normal polling
+        cadence in any way; it's just one extra read layered on top.
+        """
+        dev = self._resolve_single_inverter("Poll Now")
+        if dev is None:
+            return
+        self.logger.info(f"{dev.name}: Polling now (menu)")
+        self._poll_inverter(dev)
+
+    def force_charging_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Force Charging" item.
+
+        One-click Force Charging using the Inverter device's own configured
+        defaults (forceChargingPower/CutoffSoC/Duration) - deliberately no
+        dialog, same "quick action" posture as the other menu items here.
+        Delegates to force_charging_action itself (rather than duplicating
+        its validation/resolution logic) via a minimal stand-in object that
+        supplies just the two attributes that callback reads - deviceId and
+        an empty props dict, which makes every one of its own overridable
+        fields resolve straight through to the device defaults exactly as
+        if a real Action Group step had left them all blank.
+        """
+        dev = self._resolve_single_inverter("Force Charging")
+        if dev is None:
+            return
+        self.force_charging_action(_MenuPluginAction(dev.id))
+
+    def force_discharging_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Force Discharging" item.
+
+        Same one-click, defaults-only pattern as force_charging_menu_action -
+        see that method's docstring.
+        """
+        dev = self._resolve_single_inverter("Force Discharging")
+        if dev is None:
+            return
+        self.force_discharging_action(_MenuPluginAction(dev.id))
+
+    def toggle_debug_logging_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Toggle Debug Logging" item.
+
+        Flips showDebugInfo the same way closedPrefsConfigUi does when the
+        Configure dialog's checkbox is saved - just without the dialog.
+        Writing directly to self.pluginPrefs is the same mechanism the
+        Configure dialog itself uses to persist a value; no separate save
+        call is needed, Indigo persists this dict automatically.
+        """
+        self.debug = not self.debug
+        self.pluginPrefs["showDebugInfo"] = self.debug
+        self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
+        self.logger.info(f"Debug logging {'enabled' if self.debug else 'disabled'} (via menu)")
 
     def dashboard(self, action, dev=None, caller_waiting_for_result=None):
         """Serve the live AlphaESS dashboard page.

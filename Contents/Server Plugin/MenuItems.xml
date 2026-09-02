@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<MenuItems>
+    <!-- Indigo appends its own automatic "About AlphaESS Modbus..." item to
+         this plugin's menu - not defined here. Everything below is this
+         file's own contribution. Every item requires exactly one AlphaESS
+         Inverter device configured (see _resolve_single_inverter in
+         plugin.py) - a multi-inverter install has the equivalent Action in
+         an Action Group instead, with its own device picker. -->
+    <MenuItem id="quickActionsSeparator" type="separator" />
+    <MenuItem id="pollNowMenu">
+        <Name>Poll Now</Name>
+        <CallbackMethod>poll_now_menu_action</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="forceChargingMenu">
+        <Name>Force Charging</Name>
+        <CallbackMethod>force_charging_menu_action</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="forceDischargingMenu">
+        <Name>Force Discharging</Name>
+        <CallbackMethod>force_discharging_menu_action</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="dispatchResetMenu">
+        <Name>Dispatch Reset (Stop)</Name>
+        <CallbackMethod>dispatch_reset_menu_action</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="debugSeparator" type="separator" />
+    <MenuItem id="toggleDebugLoggingMenu">
+        <Name>Toggle Debug Logging</Name>
+        <CallbackMethod>toggle_debug_logging_menu_action</CallbackMethod>
+    </MenuItem>
+</MenuItems>
