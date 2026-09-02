@@ -141,6 +141,22 @@
                 <TriggerLabel>Dispatch Ends At Changed</TriggerLabel>
                 <ControlPageLabel>Dispatch Ends At</ControlPageLabel>
             </State>
+            <State id="dispatchCutoffSoC">
+                <ValueType>Float</ValueType>
+                <TriggerLabel>Dispatch Cutoff SoC Changed</TriggerLabel>
+                <ControlPageLabel>Dispatch Cutoff SoC</ControlPageLabel>
+                <Units>%</Units>
+            </State>
+            <State id="systemHealthOK">
+                <ValueType>Boolean</ValueType>
+                <TriggerLabel>System Health Changed</TriggerLabel>
+                <ControlPageLabel>System Health OK</ControlPageLabel>
+            </State>
+            <State id="systemHealthDetail">
+                <ValueType>String</ValueType>
+                <TriggerLabel>System Health Detail Changed</TriggerLabel>
+                <ControlPageLabel>System Health Detail</ControlPageLabel>
+            </State>
         </States>
         <UiDisplayStateId>loadPower</UiDisplayStateId>
     </Device>

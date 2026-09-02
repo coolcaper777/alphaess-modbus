@@ -43,6 +43,49 @@ INVERTER_CONFIG_FIELD_LABELS = {
     "pollInterval": "Poll Interval",
 }
 
+# Dispatch register block: 11 consecutive holding registers 0x0880-0x088A
+# (2176-2186), written atomically via Modbus function code 16
+# (write_registers) as one call. Confirmed NOT flash-backed - unlike the
+# inverter's scheduler-config registers (max_feed_to_grid, charge/discharge
+# cutoff SoC, charge/discharge time periods), which this plugin deliberately
+# never writes. Source: https://projects.hillviewlodge.ie/alphaess/'s own
+# author, in comments on that page: "Force Charging uses the Dispatch
+# registers instead (which are not stored in the flash memory)." Register
+# layout and the mode/scale constants below cross-checked against
+# senalse/ha-alphaess-modbus's docs/register_map.md and switch.py/const.py.
+# Defined here, ahead of REGISTERS below, because REGISTERS' own dispatch
+# readback entries (dispatchModeRaw etc.) need DISPATCH_START_ADDRESS at
+# module-load time, not just inside function bodies.
+#
+# Word layout (offset from DISPATCH_START_ADDRESS):
+#   0    : Start (1=start, 0=stop)
+#   1-2  : Active Power, 32-bit, 32000-biased (raw = 32000 - watts to charge,
+#          32000 + watts to discharge, 32000 = neutral)
+#   3-4  : Reactive Power, 32-bit, 32000 = neutral (always written neutral here)
+#   5    : Mode - see DISPATCH_MODE_LABELS (defined further below)
+#   6    : SoC target, raw = percent / DISPATCH_SOC_SCALE (only meaningful in
+#          mode 2, State of Charge Control)
+#   7-8  : Time, 32-bit, duration in seconds
+#   9    : Flow Direction - always written as the constant DISPATCH_FLOW_DIRECTION
+#   10   : PV Switch (0=unchanged, 1=on, 2=off) - only takes effect during an
+#          active dispatch
+DISPATCH_START_ADDRESS = 0x0880
+DISPATCH_SOC_SCALE = 0.392
+DISPATCH_MODE_SOC_CONTROL = 2
+DISPATCH_FLOW_DIRECTION = 255
+DISPATCH_PV_UNCHANGED = 0
+
+# system_fault (0x08D4) sits far from every other cluster, so it's its own
+# small extra round trip - defined here, ahead of REGISTERS below, for the
+# same load-order reason as DISPATCH_START_ADDRESS above (REGISTERS'
+# systemFaultRaw entry needs this name to already exist). inverter_warning_1/2,
+# inverter_fault_1/2 (1078/1080/1082/1084) and battery_warning/battery_fault
+# (284/286) don't need a cluster of their own - they already fall inside
+# SOLAR_CLUSTER_START/BATTERY_CLUSTER_START's existing ranges (defined further
+# below, but only referenced inside function bodies, not at module-load time,
+# so their own later position is fine).
+SYSTEM_FAULT_CLUSTER_START = 2260
+
 # Register addresses/types pulled from SorX14/alphaess_modbus (MIT-licensed)
 # registers.json, cross-checked against AlphaESS's own dispatch register
 # addresses documented on https://projects.hillviewlodge.ie/alphaess/. All are
@@ -100,6 +143,11 @@ REGISTERS = {
     "batteryDischargeEnergy": {"address": 290, "words": 2, "signed": False, "decimals": 1},
     "batteryPower": {"address": 294, "words": 1, "signed": True, "decimals": 0},
     "batteryRemainingTime": {"address": 295, "words": 1, "signed": False, "decimals": 0},
+    # Aggregate fault/warning bitmaps across all battery modules - source and
+    # decode approach explained on systemFaultRaw below. Already inside this
+    # cluster's own range (256-295), no extra Modbus round trip.
+    "batteryWarningRaw": {"address": 284, "words": 2, "signed": False, "decimals": 0},
+    "batteryFaultRaw": {"address": 286, "words": 2, "signed": False, "decimals": 0},
 
     # Solar / PV strings + inverter health (cluster: 1052-1088). Unused
     # strings simply read 0 - no special-casing needed for fewer than 6
@@ -144,6 +192,47 @@ REGISTERS = {
     # currently needs them; reading past them costs nothing extra since the
     # cluster already has to span up to invWorkMode at 1088.
     "invWorkMode": {"address": 1088, "words": 1, "signed": False, "decimals": 0},
+    # Inverter warning/fault bitmaps (one logical bitmap each, split across 2
+    # uint32 words for Modbus width reasons per senalse/ha-alphaess-modbus's
+    # register_map.md - not two separate categories). Already inside this
+    # cluster's own range (1052-1088), no extra Modbus round trip. See
+    # systemFaultRaw below for why these aren't decoded bit-by-bit.
+    "inverterWarning1Raw": {"address": 1078, "words": 2, "signed": False, "decimals": 0},
+    "inverterWarning2Raw": {"address": 1080, "words": 2, "signed": False, "decimals": 0},
+    "inverterFault1Raw": {"address": 1082, "words": 2, "signed": False, "decimals": 0},
+    "inverterFault2Raw": {"address": 1084, "words": 2, "signed": False, "decimals": 0},
+
+    # System-level fault bitmap (cluster: 2260-2261, its own small extra round
+    # trip - see SYSTEM_FAULT_CLUSTER_START). Condensed into systemHealthOK/
+    # systemHealthDetail in _poll_inverter rather than exposed as 7 individual
+    # near-permanently-zero device states: none of these bitmaps has a
+    # documented per-bit meaning anywhere checked (Hillview Lodge's page,
+    # senalse/ha-alphaess-modbus's register_map.md/const.py, or HA's own
+    # entity attributes for these same registers) - they're only usable as
+    # "zero = healthy, non-zero = something's wrong," even in the reference
+    # implementations. The 12 per-module battery_N_warning/battery_N_fault
+    # registers (0x0131-0x0147) are deliberately not read at all - disabled
+    # by default even in senalse/ha-alphaess-modbus, and the aggregate
+    # batteryWarningRaw/batteryFaultRaw above already cover "something's
+    # wrong with a module" without needing per-module granularity.
+    "systemFaultRaw": {"address": SYSTEM_FAULT_CLUSTER_START, "words": 2, "signed": False, "decimals": 0},
+
+    # Dispatch block readback (cluster: 2176-2186, DISPATCH_START_ADDRESS aka
+    # 0x0880) - the same 11 registers _write_dispatch writes, read back here
+    # to reconcile dispatchActive/dispatchModeLabel/dispatchPowerTarget/
+    # dispatchCutoffSoC against the inverter's actual state each poll, rather
+    # than trusting only what this plugin last wrote (see the DISPATCH_MODE_*
+    # decode block below _poll_inverter's other cluster handling). Added
+    # 2026-09-01 after finding Home Assistant's own dispatch UI had gone
+    # stale relative to the inverter (its input_select helpers reflect only
+    # what HA last commanded, never read back) - this plugin had the exact
+    # same latent gap on its dispatch* device states before this readback
+    # was added. Not every word is decoded - Reactive Power (words 3-4) is
+    # always written neutral and never meaningfully read; Flow Direction and
+    # PV Switch (words 9-10) aren't currently surfaced as device states.
+    "dispatchModeRaw": {"address": DISPATCH_START_ADDRESS + 5, "words": 1, "signed": False, "decimals": 0},
+    "dispatchActivePowerRaw": {"address": DISPATCH_START_ADDRESS + 1, "words": 2, "signed": False, "decimals": 0},
+    "dispatchSocRaw": {"address": DISPATCH_START_ADDRESS + 6, "words": 1, "signed": False, "decimals": 0},
 }
 
 # inverter_work_mode's documented meaning beyond these two codes is
@@ -151,35 +240,6 @@ REGISTERS = {
 # senalse/ha-alphaess-modbus project) - anything else is shown as a raw
 # fallback rather than guessed.
 INVERTER_WORK_MODE_LABELS = {1: "Normal", 2: "Bypass/EPS"}
-
-# Dispatch register block: 11 consecutive holding registers 0x0880-0x088A
-# (2176-2186), written atomically via Modbus function code 16
-# (write_registers) as one call. Confirmed NOT flash-backed - unlike the
-# inverter's scheduler-config registers (max_feed_to_grid, charge/discharge
-# cutoff SoC, charge/discharge time periods), which this plugin deliberately
-# never writes. Source: https://projects.hillviewlodge.ie/alphaess/'s own
-# author, in comments on that page: "Force Charging uses the Dispatch
-# registers instead (which are not stored in the flash memory)." Register
-# layout and the mode/scale constants below cross-checked against
-# senalse/ha-alphaess-modbus's docs/register_map.md and switch.py/const.py.
-#
-# Word layout (offset from DISPATCH_START_ADDRESS):
-#   0    : Start (1=start, 0=stop)
-#   1-2  : Active Power, 32-bit, 32000-biased (raw = 32000 - watts to charge,
-#          32000 + watts to discharge, 32000 = neutral)
-#   3-4  : Reactive Power, 32-bit, 32000 = neutral (always written neutral here)
-#   5    : Mode - see DISPATCH_MODE_LABELS
-#   6    : SoC target, raw = percent / DISPATCH_SOC_SCALE (only meaningful in
-#          mode 2, State of Charge Control)
-#   7-8  : Time, 32-bit, duration in seconds
-#   9    : Flow Direction - always written as the constant DISPATCH_FLOW_DIRECTION
-#   10   : PV Switch (0=unchanged, 1=on, 2=off) - only takes effect during an
-#          active dispatch
-DISPATCH_START_ADDRESS = 0x0880
-DISPATCH_SOC_SCALE = 0.392
-DISPATCH_MODE_SOC_CONTROL = 2
-DISPATCH_FLOW_DIRECTION = 255
-DISPATCH_PV_UNCHANGED = 0
 
 # Force Charging/Discharging always write mode 2 (SoC Control) - the reference
 # implementation (senalse/ha-alphaess-modbus's switch.py) does the same for
@@ -292,6 +352,7 @@ SYSTEM_TIME_CLUSTER_START = 1856
 INVERTER_STATE_KEYS = [
     "loadPower", "invTemperature", "invWorkMode", "systemTime",
     "dispatchActive", "dispatchType", "dispatchModeLabel", "dispatchPowerTarget", "dispatchEndsAt",
+    "dispatchCutoffSoC", "systemHealthOK", "systemHealthDetail",
 ]
 SOLAR_STATE_KEYS = ["pvPower"] + [f"pv{n}{suffix}" for n in PV_STRINGS for suffix in ("Voltage", "Current", "Power")]
 BATTERY_STATE_KEYS = [
@@ -315,6 +376,8 @@ REGISTER_CLUSTERS = [
     (SOLAR_CLUSTER_START, 37),     # 1052-1088: grid frequency, 6 PV strings, inverter temperature, work mode
     (BATTERY_CLUSTER_START, 40),   # 256-295: battery voltage/current/status/cells/energy/power/remaining time
     (SYSTEM_TIME_CLUSTER_START, 3),  # 1856-1858: inverter clock (year/month, day/hour, minute/second)
+    (DISPATCH_START_ADDRESS, 11),  # 2176-2186: dispatch block readback - see the REGISTERS comment above
+    (SYSTEM_FAULT_CLUSTER_START, 2),  # 2260-2261: system_fault only - see the REGISTERS comment on systemFaultRaw
 ]
 
 # Served at http://<this-mac>:8176/message/com.coolcaper.alphaessmodbus/dashboard
@@ -579,6 +642,9 @@ DASHBOARD_HTML = """<!doctype html>
     var pw = inverter.dispatchPowerTarget || 0;
     container.appendChild(row("Power target", pw === 0 ? "Neutral"
       : (pw > 0 ? "\u2193 Discharging \u00b7 " + formatPower(pw) : "\u2191 Charging \u00b7 " + formatPower(Math.abs(pw)))));
+    if (inverter.dispatchCutoffSoC) {
+      container.appendChild(row("Cutoff SoC", fmt(inverter.dispatchCutoffSoC, 1, "%")));
+    }
     container.appendChild(row("Ends at", inverter.dispatchEndsAt || "-"));
   }
 
@@ -667,6 +733,9 @@ DASHBOARD_HTML = """<!doctype html>
       if (data.inverter.dispatchActive) {
         metaParts.push("Dispatch: " + (DISPATCH_TYPE_LABELS[data.inverter.dispatchType] || data.inverter.dispatchType || "active"));
       }
+      if (data.inverter.systemHealthOK === false) {
+        metaParts.push("\u26a0 " + (data.inverter.systemHealthDetail || "Fault/warning active"));
+      }
     }
     document.getElementById("inverterMeta").textContent = metaParts.join(" \u00b7 ");
 
@@ -738,6 +807,126 @@ DASHBOARD_HTML = """<!doctype html>
 </body>
 </html>
 """
+
+
+# Bit-name lookups for systemHealthDetail's fault/warning decode in
+# _poll_inverter - sourced from AlphaESS's own official "Household Modbus
+# Register Parameter List" PDF (Note4/Note6/Note26/Note28/Note32), not
+# reverse-engineered. That PDF isn't linked directly from AlphaESS's own
+# site but is mirrored at https://projects.hillviewlodge.ie/_alphaess/ -
+# fetching it needs a Referer header set to that site or the host 403s a
+# direct request. INVERTER_FAULT1_BITS/INVERTER_FAULT2_BITS and
+# INVERTER_WARNING1_BITS/INVERTER_WARNING2_BITS are exact - their source
+# table's two columns are two actual separate registers (Fault1 vs Fault2,
+# Warning1 vs Warning2), not ambiguous. SYSTEM_FAULT_BITS and
+# BATTERY_FAULT_BITS are best-effort: their source table has two columns for
+# different EMS firmware platforms (EMS2.5 vs EMS3.5/EMS3.6, or a similar
+# platform split) that couldn't be reliably attributed per-bit from the
+# PDF's flattened text extraction - where the two differed, both are joined
+# with " / " rather than guessing which applies to this specific inverter's
+# firmware. Bits with no name in the source table (reserved/undefined) fall
+# back to "bit N" in _decode_fault_bits rather than being silently dropped.
+SYSTEM_FAULT_BITS = {
+    0: "Network_Card_Fault", 1: "Rtc_Fault", 2: "EEprom_Fault", 3: "INV_Comms_Error",
+    4: "Grid_Meter_Lost", 5: "PV_Meter_Lost / Meter Not Set", 6: "BMS_Lost",
+    7: "UPS_Battery_Volt_Low / SD not inserted or SD write error", 8: "Backup_Overload",
+    9: "INV_Slave_Lost", 10: "INV_Master_Lost", 11: "Parallel_Comm_Error",
+    12: "Parallel_Mode_Differ", 13: "Flash_Fault", 14: "SDRAM error",
+    15: "Extension CAN error", 16: "inv type not specified", 18: "DG_PV_Conflict",
+    19: "PV_INV_Fault", 20: "AirConFault", 23: "GC_Fault", 25: "OverCurr",
+    26: "PcsModeFault", 27: "BatEnergyLow",
+}
+BATTERY_FAULT_BITS = {
+    0: "Temperature sensor error", 1: "Mos error", 2: "Cell Temp Differ / Circuit breaker open",
+    3: "Balancer Fault / Dial switching mode inconsistence",
+    4: "Charge Over Current / Slave battery communication lost",
+    5: "Balancer Mos Fault / Sn missing",
+    6: "Discharge Over Current / Master battery communication lost",
+    7: "Pole Over Temp / Firmware versions inconsistence",
+    8: "Cell Over Volt / Multi master error",
+    9: "Cell Volt Differ / Mos high temperature",
+    10: "Discharge Low Temp / Insulation fault",
+    11: "Total pressure abnormal",
+    12: "Cell Low Volt / Mos feedback failure",
+    13: "ISO Comm Fault / Prefilled failure",
+    14: "LMU SN Repeat / 17823 communication failure",
+    15: "17841 communication failure",
+    16: "IR Fault / Mos temperature sensor error",
+    17: "LMU Comm Fault", 18: "Cell Over Temp", 19: "BMU Comm Fault",
+    21: "Charge Low Temp", 23: "Volt Detect Fault", 24: "Wire Harness Fault",
+    26: "Relay Fault", 27: "LMU ID Repeat", 28: "LMU ID Discontinuous",
+    29: "Current Sensor Fault", 31: "Temp Sensor Fault",
+}
+BATTERY_WARNING_BITS = {
+    0: "Temperature imbalance", 1: "Over temperature", 2: "Discharge low temperature",
+    3: "Charge low temperature", 4: "Discharge over current", 5: "Charge over current",
+    6: "Cell over voltage", 7: "Cell low voltage", 8: "sw_inconsistence",
+    9: "mos_temperature_sensor_error", 10: "soc_inconsistence", 11: "bms_sci_lost",
+    12: "bms_fan_err",
+}
+INVERTER_FAULT1_BITS = {
+    0: "Grid_OVP", 1: "Grid_UVP", 2: "Grid_OFP", 3: "Grid_UFP", 4: "phase_locked_fault",
+    5: "bus_ovp1", 6: "bus_ovp2", 7: "insulation_fault", 8: "gfci_fault", 9: "gfci_test_fault",
+    10: "grid_relay_fault", 11: "over_temperature", 12: "pv_reverse", 13: "bat_reverse",
+    14: "m_s_com_fault", 15: "display_com_fault", 16: "chip1_upgrade_fault", 17: "mppt1_ovp",
+    18: "mppt1_sw_ocp", 19: "mppt1_hw_ocp", 20: "mppt1_otp", 21: "mppt2_ovp", 22: "mppt2_sw_ocp",
+    23: "mppt2_hw_ocp", 24: "mppt2_otp", 25: "bat_ovp", 26: "bat_uvp", 27: "battery_lose",
+    28: "bat_otp", 29: "bat1_charge_ocp", 30: "bat1_discharge_ocp", 31: "bat2_charge_ocp",
+}
+INVERTER_FAULT2_BITS = {
+    0: "bat2_discharge_ocp", 1: "bat1_hw_ocp", 2: "bat2_hw_ocp", 3: "inv_otp", 4: "inv_ovp",
+    5: "inv_uvp", 6: "output_dc_over_current", 7: "inv_ocp", 8: "inv_hw_ocp",
+    9: "output_dc_over_voltage", 10: "output_short", 11: "output_overload", 12: "apu_uvp",
+    13: "bat_relay_fault", 14: "dc_input_disturbance", 15: "grid_disturbance",
+    16: "gird_unbalance", 17: "freq_jitter", 18: "grid_overcurrent",
+    19: "grid_current_track_fault", 20: "backup_ovp", 21: "dc_bus_unbalancevolt",
+    22: "dc_bus_undervolt", 23: "dc_bus_unbalancevolt2", 24: "igbt_over_current",
+    25: "grid_disturbance2", 26: "afci_check_protect", 27: "grid_current_sampling_abnormal",
+    28: "dsp_selfcheck", 29: "grid_short_time_over_current", 30: "bat_overvolt_hardware_fault",
+    31: "zero_ground_fault",
+}
+INVERTER_WARNING1_BITS = {
+    0: "bat_over_voltage_alarm", 1: "bat_under_voltage_alarm", 2: "output_overload_alarm",
+    3: "abnormal_temperature_sensor", 4: "dc_power_alarm", 5: "battery_stops_running_alarm",
+    6: "over_temperature_alarm", 7: "pv_volt_high_alarm", 8: "bat_open_alarm",
+    9: "bat_reverse_alarm", 10: "bus_over_alarm", 11: "grid_loss_alarm", 12: "grid_volt_alarm",
+    13: "grid_freq_alarm", 14: "10min_grid_volt_alarm", 15: "grid_volt_inst_over",
+    16: "pe_loss_alarm", 17: "ln_reverse", 18: "low_temper_alarm", 19: "gfci_alarm",
+    20: "iso_alarm", 21: "dci_alarm", 22: "dcv_alarm", 23: "island_alarm",
+    24: "fan_abnormal_alarm", 25: "n_loss_alarm", 26: "ems_sci_alarm", 27: "ems_can_alarm",
+    28: "flashid_alarm", 29: "read_flash_alarm", 30: "write_flash_alarm",
+    31: "machine_type_alarm",
+}
+INVERTER_WARNING2_BITS = {
+    0: "inv_volt_low_alarm", 1: "inv_over_curr_sw_alarm", 2: "inv_over_curr_hw_alarm",
+    3: "bst_over_curr_sw_alarm", 4: "bst_over_curr_hw_alarm", 5: "buck_bst_over_curr_sw_alarm",
+    6: "buck_bst_over_curr_hw_alarm", 7: "bus_under", 8: "no_pv_input_alarm",
+    9: "input_power_limit_alarm", 10: "output_power_limit_alarm",
+    11: "reduce_pby_over_freq_alarm", 12: "reduce_pby_over_volt_alarm",
+    13: "reduce_pby_over_temp_alarm", 14: "hvrt_alarm", 15: "lvrt_alarm", 16: "ntc_fail_alarm",
+    17: "grid_waveform_abnormal_alarm", 18: "eps_capacitance_decrease", 19: "para_alarm",
+    20: "para_error_location", 21: "para_avg_overload", 22: "para_module_addr_same",
+    23: "para_online_enter_fail", 24: "para_unbalance_power", 25: "para_turnon_inconsistent",
+    26: "grid_backup_n_lost", 27: "bat_num_abnormal", 28: "grid_phase_order_fault",
+    29: "dcv_sample_abnormal", 30: "blackbox_flash_fault", 31: "rtc_fault",
+}
+
+
+def _decode_fault_bits(raw: int, bit_names: dict) -> str:
+    """Decode a 32-bit fault/warning bitmap into a comma-joined list of set bit names.
+
+    Args:
+        raw (int): The raw uint32 bitmap value.
+        bit_names (dict): bit index -> name, one of the *_BITS lookups above.
+
+    Returns:
+        str: Comma-joined names of every set bit, e.g. "Battery Fault=4"
+            decodes to "Charge Over Current / Slave battery communication
+            lost". A set bit with no entry in bit_names (reserved/undefined
+            in the source table) falls back to "bit N" rather than being
+            silently dropped.
+    """
+    return ", ".join(bit_names.get(i, f"bit {i}") for i in range(32) if raw & (1 << i))
 
 
 def _decode_value(registers: list, signed: bool, decimals: int) -> float:
@@ -1242,6 +1431,64 @@ class Plugin(indigo.PluginBase):
             })
         if time_ok:
             inverter_states.append({"key": "systemTime", "value": _decode_system_time(cluster_registers[SYSTEM_TIME_CLUSTER_START])})
+
+        # Reconcile dispatch* states against the inverter's own readback
+        # every poll, rather than trusting only what _start_dispatch/
+        # _stop_dispatch last wrote - see the REGISTERS comment on
+        # dispatchModeRaw for why. mode 0 means no dispatch is active
+        # (matches every "nothing engaged" reading seen against this
+        # hardware). dispatchType/dispatchEndsAt have no register
+        # equivalent - the inverter doesn't track which Indigo action
+        # started a dispatch or expose a remaining-time countdown (the Time
+        # word reads back as the configured duration, not a countdown, per
+        # direct observation), so those two stay write-side/informational,
+        # only cleared here when readback confirms nothing is active.
+        dispatch_ok = DISPATCH_START_ADDRESS in cluster_registers
+        if dispatch_ok:
+            dispatch_mode_raw = int(values["dispatchModeRaw"])
+            dispatch_active = dispatch_mode_raw != 0
+            dispatch_power_w = int(values["dispatchActivePowerRaw"]) - 32000
+            cutoff_soc = (
+                values["dispatchSocRaw"] * DISPATCH_SOC_SCALE
+                if dispatch_active and dispatch_mode_raw == DISPATCH_MODE_SOC_CONTROL else 0.0
+            )
+            inverter_states.append({"key": "dispatchActive", "value": dispatch_active})
+            inverter_states.append({
+                "key": "dispatchModeLabel",
+                "value": DISPATCH_MODE_LABELS.get(dispatch_mode_raw, f"Unknown mode ({dispatch_mode_raw})") if dispatch_active else "",
+            })
+            inverter_states.append({"key": "dispatchPowerTarget", "value": dispatch_power_w if dispatch_active else 0})
+            inverter_states.append({"key": "dispatchCutoffSoC", "value": round(cutoff_soc, 1), "decimalPlaces": 1})
+            if not dispatch_active:
+                inverter_states.append({"key": "dispatchType", "value": ""})
+                inverter_states.append({"key": "dispatchEndsAt", "value": ""})
+
+        # Condensed fault/warning health check - see the REGISTERS comment on
+        # systemFaultRaw for why this is one boolean + a detail string rather
+        # than 7 individual near-permanently-zero device states, and the
+        # comment above _decode_fault_bits for where the bit-name decode
+        # comes from. Only set when every one of the three relevant clusters
+        # actually read this cycle - a partial read shouldn't produce a
+        # false "all clear" from incomplete data, same posture as loadPower
+        # below.
+        fault_ok = SYSTEM_FAULT_CLUSTER_START in cluster_registers
+        if solar_ok and battery_ok and fault_ok:
+            problems = []
+            for label, key, bit_names in (
+                ("System Fault", "systemFaultRaw", SYSTEM_FAULT_BITS),
+                ("Inverter Warning 1", "inverterWarning1Raw", INVERTER_WARNING1_BITS),
+                ("Inverter Warning 2", "inverterWarning2Raw", INVERTER_WARNING2_BITS),
+                ("Inverter Fault 1", "inverterFault1Raw", INVERTER_FAULT1_BITS),
+                ("Inverter Fault 2", "inverterFault2Raw", INVERTER_FAULT2_BITS),
+                ("Battery Warning", "batteryWarningRaw", BATTERY_WARNING_BITS),
+                ("Battery Fault", "batteryFaultRaw", BATTERY_FAULT_BITS),
+            ):
+                raw = int(values[key])
+                if raw:
+                    problems.append(f"{label}: {_decode_fault_bits(raw, bit_names)}")
+            inverter_states.append({"key": "systemHealthOK", "value": len(problems) == 0})
+            inverter_states.append({"key": "systemHealthDetail", "value": "; ".join(problems)})
+
         load_power = None
         if grid_ok and battery_ok and solar_ok:
             # Matches the Hillview integration's "house load" formula: PV +
@@ -1448,14 +1695,20 @@ class Plugin(indigo.PluginBase):
         end_at = time.time() + duration_s
         self._dispatch_end_at[dev.id] = end_at
         mode_label = DISPATCH_MODE_LABELS.get(mode, f"Unknown mode ({mode})")
+        cutoff_pct = soc_raw * DISPATCH_SOC_SCALE if mode == DISPATCH_MODE_SOC_CONTROL else 0.0
+        # Optimistic feedback, immediately - _poll_inverter's dispatch-block
+        # readback (see the REGISTERS comment on dispatchModeRaw) reconciles
+        # these against the inverter's actual state on the very next poll
+        # regardless, so a momentarily-optimistic value here is harmless.
         dev.updateStatesOnServer([
             {"key": "dispatchActive", "value": True},
             {"key": "dispatchType", "value": dispatch_type},
             {"key": "dispatchModeLabel", "value": mode_label},
             {"key": "dispatchPowerTarget", "value": dispatch_power_w},
             {"key": "dispatchEndsAt", "value": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_at))},
+            {"key": "dispatchCutoffSoC", "value": round(cutoff_pct, 1), "decimalPlaces": 1},
         ])
-        cutoff_txt = f"{soc_raw * DISPATCH_SOC_SCALE:.1f}% (raw soc={soc_raw})" if mode == DISPATCH_MODE_SOC_CONTROL else "n/a for this mode"
+        cutoff_txt = f"{cutoff_pct:.1f}% (raw soc={soc_raw})" if mode == DISPATCH_MODE_SOC_CONTROL else "n/a for this mode"
         self.logger.info(
             f"{dev.name}: Dispatch started - type={dispatch_type}, mode={mode_label}, "
             f"power={dispatch_power_w}W, cutoffSoC={cutoff_txt}, duration={duration_s}s"
@@ -1492,6 +1745,7 @@ class Plugin(indigo.PluginBase):
             {"key": "dispatchModeLabel", "value": ""},
             {"key": "dispatchPowerTarget", "value": 0},
             {"key": "dispatchEndsAt", "value": ""},
+            {"key": "dispatchCutoffSoC", "value": 0.0, "decimalPlaces": 1},
         ])
 
     @staticmethod

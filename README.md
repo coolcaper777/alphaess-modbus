@@ -48,11 +48,14 @@ The parent device — holds the connection config, auto-discovers the three devi
 | `invTemperature` | Inverter internal temperature (°C) |
 | `invWorkMode` | Inverter operating mode (`Normal`, `Bypass/EPS`, or `Unknown work mode (N)` for any other model-specific code) |
 | `systemTime` | Inverter's own clock, as reported by the inverter (`YYYY-MM-DD HH:MM:SS`) |
-| `dispatchActive` | `true` while a Force Charging/Force Discharging/Force Import/Dispatch command is running |
-| `dispatchType` | Which action started the active dispatch (`forceCharging`/`forceDischarging`/`forceImport`/`dispatch`) |
-| `dispatchModeLabel` | The active dispatch's mode name (e.g. `State of Charge Control`) |
-| `dispatchPowerTarget` | The active dispatch's power target — positive = discharging, negative = charging (W), same convention as `batteryPower` |
-| `dispatchEndsAt` | When the active dispatch will auto-stop (`YYYY-MM-DD HH:MM:SS`), or blank if none is active |
+| `dispatchActive` | `true` while a Force Charging/Force Discharging/Force Import/Dispatch command is running — read back from the inverter's own dispatch registers every poll, not just tracked from the last action this plugin sent, so it stays correct even if something else (another integration, the inverter's own app) changes dispatch independently |
+| `dispatchType` | Which action started the active dispatch (`forceCharging`/`forceDischarging`/`forceImport`/`dispatch`) — this one *is* just this plugin's own memory of what it last did, since the inverter doesn't track "who" dispatched it |
+| `dispatchModeLabel` | The active dispatch's mode name (e.g. `State of Charge Control`) — read back from the inverter, same as `dispatchActive` |
+| `dispatchPowerTarget` | The active dispatch's power target — positive = discharging, negative = charging (W), same convention as `batteryPower` — read back from the inverter |
+| `dispatchCutoffSoC` | The active dispatch's SoC target (%) — only meaningful under State of Charge Control, `0` otherwise — read back from the inverter |
+| `dispatchEndsAt` | When this plugin expects the active dispatch to auto-stop (`YYYY-MM-DD HH:MM:SS`), or blank if none is active — this one's an estimate (the inverter doesn't expose a remaining-time countdown), so it can be wrong if something else's dispatch is currently active instead of this plugin's own |
+| `systemHealthOK` | `false` if any of the inverter/battery/system fault or warning bitmaps are non-zero, `true` otherwise. Condensed from 7 raw registers — none of them have a documented per-bit meaning anywhere checked (not even the reference HA integration this plugin is cross-checked against), so "some bit is set" is the most specific thing worth exposing as a persistent state |
+| `systemHealthDetail` | Which specific bitmap(s) are non-zero, decoded to their actual named fault/warning (e.g. `Battery Fault: Charge Over Current / Slave battery communication lost`) using AlphaESS's own official bit definitions, blank when `systemHealthOK` is `true` |
 
 ### AlphaESS Solar (`solarDevice`)
 
