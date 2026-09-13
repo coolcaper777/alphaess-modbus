@@ -360,12 +360,24 @@ GRID_CLUSTER_START = 16
 # cluster's range.
 SYSTEM_TIME_CLUSTER_START = 1856
 
+# Inverter's own DSP Master Software Version (String(10), 5 registers) -
+# deliberately NOT in REGISTERS/REGISTER_CLUSTERS, so it's never read on the
+# normal poll cycle. EMS firmware version (the component that actually
+# governs dispatch behaviour) reads back static garbage on this hardware -
+# see ARCHITECTURE.md - but this field decodes cleanly to a real version
+# string, and AlphaESS almost certainly bundles inverter/EMS firmware
+# together in one release, so a change here is a reasonable proxy. Read only
+# on demand via check_firmware_version_menu_action, at the user's own
+# request, rather than continuously - there's no need to poll a value that
+# only ever changes when AlphaESS pushes a firmware update.
+INVERTER_MASTER_SW_VERSION_ADDRESS = 0x0640
+
 # Every state each child device exposes, in display order - used by
 # dashboard_data to hand the dashboard page every value it has (not just the
 # handful summarized on the four top tiles), grouped per device the same way
 # Devices.xml groups them.
 INVERTER_STATE_KEYS = [
-    "loadPower", "invTemperature", "invWorkMode", "systemTime",
+    "loadPower", "invTemperature", "invWorkMode", "systemTime", "inverterFirmwareVersion",
     "dispatchActive", "dispatchType", "dispatchModeLabel", "dispatchPowerTarget", "dispatchEndsAt",
     "dispatchCutoffSoC", "systemHealthOK", "systemHealthDetail",
 ]
@@ -423,6 +435,7 @@ DASHBOARD_HTML = """<!doctype html>
     --series-solar: #eb6834;
     --series-battery: #1baf7a;
     --series-home: #eda100;
+    --series-ev: #9958e0;
     --status-critical: #d03b3b;
   }
   @media (prefers-color-scheme: dark) {
@@ -438,6 +451,7 @@ DASHBOARD_HTML = """<!doctype html>
       --series-solar: #d95926;
       --series-battery: #199e70;
       --series-home: #c98500;
+      --series-ev: #a96eea;
       --status-critical: #e66767;
     }
   }
@@ -464,23 +478,19 @@ DASHBOARD_HTML = """<!doctype html>
     color: var(--status-critical); border: 1px solid var(--status-critical);
     background: color-mix(in srgb, var(--status-critical) 10%, transparent);
   }
-  .grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-  }
-  .tile {
-    background: var(--surface-1); border: 1px solid var(--border);
-    border-radius: 14px; padding: 16px;
-  }
-  .tile-label { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 13px; margin-bottom: 10px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
   .dot-grid { background: var(--series-grid); }
   .dot-solar { background: var(--series-solar); }
   .dot-battery { background: var(--series-battery); }
   .dot-home { background: var(--series-home); }
+  .dot-ev { background: var(--series-ev); }
   .dot-neutral { background: var(--text-muted); }
-  .value { font-size: 28px; font-weight: 600; line-height: 1.1; }
   .sub { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
+  .flowWrap {
+    position: relative; margin-bottom: 12px;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 14px;
+  }
+  #flowCanvas { display: block; width: 100%; height: 400px; }
   .details {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
     gap: 12px; margin-top: 12px;
@@ -504,6 +514,19 @@ DASHBOARD_HTML = """<!doctype html>
   .strings-table th:first-child, .strings-table td:first-child { text-align: left; }
   .strings-table td { text-align: right; padding: 6px 0; border-top: 1px solid var(--border); }
   .empty-note { color: var(--text-muted); font-size: 13px; }
+  .dispatchBtn {
+    font: inherit; color: var(--text-primary); background: var(--page-plane);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px;
+    cursor: pointer;
+  }
+  .dispatchBtn:hover { background: var(--border); }
+  .dispatchBtn-stop { color: var(--status-critical); border-color: var(--status-critical); }
+  .dispatchField { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--text-secondary); }
+  .dispatchField input, .dispatchField select {
+    font: inherit; color: var(--text-primary); background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  .dispatchSummary { cursor: pointer; color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
   footer { margin-top: 24px; color: var(--text-muted); font-size: 12px; }
 </style>
 </head>
@@ -522,28 +545,58 @@ DASHBOARD_HTML = """<!doctype html>
 
   <div class="banner" id="banner">&#9888; <span id="bannerText"></span></div>
 
-  <div class="grid">
-    <div class="tile">
-      <div class="tile-label"><span class="dot dot-solar"></span>Solar</div>
-      <div class="value" id="pvPower">-</div>
-    </div>
-    <div class="tile">
-      <div class="tile-label"><span class="dot dot-grid"></span>Grid</div>
-      <div class="value" id="gridPower">-</div>
-      <div class="sub" id="gridDirection">-</div>
-    </div>
-    <div class="tile">
-      <div class="tile-label"><span class="dot dot-battery"></span>Battery</div>
-      <div class="value" id="batterySoC">-</div>
-      <div class="sub" id="batteryDirection">-</div>
-    </div>
-    <div class="tile">
-      <div class="tile-label"><span class="dot dot-home"></span>Home</div>
-      <div class="value" id="loadPower">-</div>
-    </div>
+  <div class="flowWrap">
+    <canvas id="flowCanvas"></canvas>
   </div>
 
   <div class="details">
+    <div class="detail-card">
+      <h2><span class="dot dot-neutral" style="display:inline-block;"></span> Manual Dispatch</h2>
+      <div style="display:flex; flex-wrap:wrap; gap:8px;">
+        <button type="button" id="btnForceCharging" class="dispatchBtn">Force Charging</button>
+        <button type="button" id="btnForceDischarging" class="dispatchBtn">Force Discharging</button>
+        <button type="button" id="btnStopDispatch" class="dispatchBtn dispatchBtn-stop">Stop Dispatch</button>
+      </div>
+      <details style="margin-top:10px;">
+        <summary class="dispatchSummary">Advanced Dispatch</summary>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+          <label class="dispatchField">Mode
+            <select id="dispatchMode">
+              <option value="1">Battery only Charges from PV</option>
+              <option value="2" selected>State of Charge Control</option>
+              <option value="3">Load Following</option>
+              <option value="4">Maximise Output</option>
+              <option value="5">Normal Mode</option>
+              <option value="6">Optimise Consumption</option>
+              <option value="7">Maximise Consumption</option>
+              <option value="19">No Battery Charge</option>
+            </select>
+          </label>
+          <label class="dispatchField">Power (kW, +discharge / -charge)
+            <input type="number" id="dispatchPower" step="0.1" placeholder="device default">
+          </label>
+          <label class="dispatchField">Cutoff SoC (%)
+            <input type="number" id="dispatchCutoffSoc" step="1" placeholder="100">
+          </label>
+          <label class="dispatchField">Duration (min)
+            <input type="number" id="dispatchDuration" step="1" placeholder="120">
+          </label>
+          <label class="dispatchField">PV Switch
+            <select id="dispatchPvSwitch">
+              <option value="0" selected>Leave unchanged</option>
+              <option value="1">PV On</option>
+              <option value="2">PV Off</option>
+            </select>
+          </label>
+          <button type="button" id="btnDispatch" class="dispatchBtn">Start Dispatch</button>
+        </div>
+      </details>
+      <div class="sub" id="dispatchControlStatus"></div>
+    </div>
+    <div class="detail-card">
+      <h2><span class="dot dot-neutral" style="display:inline-block;"></span> Dispatch</h2>
+      <div class="rows" id="dispatchDetail"><span class="empty-note">No dispatch currently active</span></div>
+    </div>
     <div class="detail-card">
       <h2><span class="dot dot-solar" style="display:inline-block;"></span> Solar strings</h2>
       <div id="solarDetail"><span class="empty-note">No solar device yet</span></div>
@@ -555,10 +608,6 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="detail-card">
       <h2><span class="dot dot-grid" style="display:inline-block;"></span> Grid detail</h2>
       <div class="rows" id="gridDetail"><span class="empty-note">No grid device yet</span></div>
-    </div>
-    <div class="detail-card">
-      <h2><span class="dot dot-neutral" style="display:inline-block;"></span> Dispatch</h2>
-      <div class="rows" id="dispatchDetail"><span class="empty-note">No dispatch currently active</span></div>
     </div>
   </div>
 
@@ -736,6 +785,371 @@ DASHBOARD_HTML = """<!doctype html>
     container.appendChild(table);
   }
 
+  // ---------- Flow diagram (added 2026-09-13) ----------
+  // Same visual language/math as the LuminaHome iPad app's own SwiftUI flow
+  // diagram (quad-bezier flow lines, animated dots scaled by power/direction)
+  // ported to plain <canvas> + requestAnimationFrame, since this page has no
+  // SwiftUI equivalent to lean on. Sign conventions match this plugin's own
+  // states exactly (batteryPower: positive=discharging; gridPower:
+  // negative=exporting), same as the app - no flipping needed either way.
+  var flowCanvas = document.getElementById("flowCanvas");
+  var flowCtx = flowCanvas.getContext("2d");
+  var flowLatest = null;
+  var flowDpr = window.devicePixelRatio || 1;
+
+  function flowColor(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function flowHexToRgba(hex, alpha) {
+    hex = hex.replace("#", "");
+    if (hex.length === 3) hex = hex.split("").map(function (c) { return c + c; }).join("");
+    var r = parseInt(hex.substr(0, 2), 16), g = parseInt(hex.substr(2, 2), 16), b = parseInt(hex.substr(4, 2), 16);
+    return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+  }
+
+  // Same red(0%) -> yellow(50%) -> green(100%) gradient as the LuminaHome
+  // app's own socColor(_:) in EnergyTileView.swift, ported exactly
+  // (including the 0.75 brightness scale-down) rather than approximated, so
+  // the battery node and its flow line read the same way here as they do
+  // in the app.
+  function flowSocColorHex(pct) {
+    var t = Math.max(0, Math.min(1, pct / 100));
+    var r = t < 0.5 ? 1.0 : 1.0 - (t - 0.5) * 2.0;
+    var g = t < 0.5 ? t * 2.0 : 1.0;
+    var brightness = 0.75;
+    function toHex(v) {
+      var h = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16);
+      return h.length === 1 ? "0" + h : h;
+    }
+    return "#" + toHex(r * brightness) + toHex(g * brightness) + toHex(0);
+  }
+
+  function flowResize() {
+    var rect = flowCanvas.getBoundingClientRect();
+    flowDpr = window.devicePixelRatio || 1;
+    flowCanvas.width = Math.max(1, Math.round(rect.width * flowDpr));
+    flowCanvas.height = Math.max(1, Math.round(rect.height * flowDpr));
+    flowCtx.setTransform(flowDpr, 0, 0, flowDpr, 0, 0);
+  }
+  window.addEventListener("resize", flowResize);
+
+  function flowQuadBezier(p0, p1, p2, t) {
+    var mt = 1 - t;
+    return { x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x, y: mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y };
+  }
+  function flowControlPoint(from, to, bend) {
+    bend = bend || 26;
+    var mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
+    var dx = to.x - from.x, dy = to.y - from.y;
+    var len = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+    return { x: mx - (dy / len) * bend, y: my + (dx / len) * bend };
+  }
+  function flowPhasePerSecond(watts) {
+    var clamped = Math.max(0, Math.min(Math.abs(watts), 10000));
+    return (0.001 + 0.021 * Math.pow(clamped / 10000, 0.55)) * 60;
+  }
+  // Only drawn at all when there's real power flowing - tried an
+  // always-draw-a-faint-static-line version on 2026-09-13 to keep Solar/EV
+  // feeling "wired in" when idle, but the user found it didn't actually
+  // help the perceived-distance issue (the real fix was Solar's text-side
+  // repositioning below) and preferred the plain look, so reverted.
+  function flowDrawLine(from, to, colorHex, reverse, watts) {
+    var cp = flowControlPoint(from, to);
+    flowCtx.beginPath();
+    flowCtx.moveTo(from.x, from.y);
+    flowCtx.quadraticCurveTo(cp.x, cp.y, to.x, to.y);
+    flowCtx.strokeStyle = flowHexToRgba(colorHex, 0.2);
+    flowCtx.lineWidth = 3.5; flowCtx.lineCap = "round"; flowCtx.stroke();
+    flowCtx.beginPath();
+    flowCtx.moveTo(from.x, from.y);
+    flowCtx.quadraticCurveTo(cp.x, cp.y, to.x, to.y);
+    flowCtx.strokeStyle = flowHexToRgba(colorHex, 0.08);
+    flowCtx.lineWidth = 13; flowCtx.stroke();
+    var count = Math.max(3, Math.min(7, Math.floor(Math.abs(watts) / 600) + 3));
+    var t0 = (Date.now() / 1000 * flowPhasePerSecond(watts)) % 1;
+    for (var i = 0; i < count; i++) {
+      var t = (t0 + i / count) % 1;
+      if (reverse) t = 1 - t;
+      var pt = flowQuadBezier(from, cp, to, t);
+      var fade = Math.sin(t * Math.PI);
+      // Small glow halo behind each dot, on top of the fatter translucent
+      // track stroke above - this is the specific bit that reads as
+      // "glowing" rather than just a plain moving circle.
+      flowCtx.beginPath();
+      flowCtx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
+      flowCtx.fillStyle = flowHexToRgba(colorHex, Math.max(0, 0.35 * fade));
+      flowCtx.fill();
+      flowCtx.beginPath();
+      flowCtx.arc(pt.x, pt.y, 3.4, 0, Math.PI * 2);
+      flowCtx.fillStyle = flowHexToRgba(colorHex, Math.max(0, 0.95 * fade));
+      flowCtx.fill();
+    }
+  }
+
+  // Fixed, generous floors (not just a computed min) so side nodes and the
+  // bigger Home node can never overlap regardless of the card's actual
+  // rendered aspect ratio - caught live 2026-09-13, the previous
+  // width/height-derived formula could land well under what Home's own
+  // ring radii needed, and the shortfall isn't obvious from the numbers
+  // alone without seeing it rendered. Elliptical (rx > ry), not circular -
+  // also caught live: Solar/EV don't need as much clearance from Home as
+  // Battery/Grid do, and giving them the same radius as the horizontal
+  // spokes just left a lot of dead space above/below, most noticeable
+  // exactly when Solar/EV are near-zero (e.g. after dark, or no EV
+  // connected) and sit far from Home with nothing visually linking them.
+  function flowLayout(w, h) {
+    var cx = w / 2, cy = h / 2;
+    var rx = Math.max(130, Math.min(cx - 60, cy - 70));
+    var ry = Math.max(90, Math.min(cy - 65, 96));
+    return {
+      center: { x: cx, y: cy },
+      solar: { x: cx, y: cy - ry },
+      battery: { x: cx - rx, y: cy },
+      grid: { x: cx + rx, y: cy },
+      ev: { x: cx, y: cy + ry }
+    };
+  }
+
+  function flowRoundedRectPath(x, y, w, h, r) {
+    var rr = Math.min(r, w / 2, h / 2);
+    flowCtx.moveTo(x + rr, y);
+    flowCtx.arcTo(x + w, y, x + w, y + h, rr);
+    flowCtx.arcTo(x + w, y + h, x, y + h, rr);
+    flowCtx.arcTo(x, y + h, x, y, rr);
+    flowCtx.arcTo(x, y, x + w, y, rr);
+    flowCtx.closePath();
+  }
+
+  // Simple hand-drawn vector icons (not emoji, for consistent cross-platform
+  // rendering) approximating the LuminaHome iPad app's SF Symbol choices -
+  // sun.max.fill/bolt.fill/battery.*/house.fill/bolt.car.fill. socFraction
+  // (0-1) is battery-only: fills an inner rectangle proportional to charge,
+  // same idea as the app picking a different battery.N glyph per level.
+  // Battery/EV redrawn 2026-09-13 (rounded rect + curved roofline) after the
+  // first pass read as too plain/crude; sun shrunk after reading as too big.
+  function flowDrawIcon(kind, cx, cy, size, colorHex, socFraction) {
+    flowCtx.save();
+    flowCtx.fillStyle = colorHex;
+    flowCtx.strokeStyle = colorHex;
+    flowCtx.lineJoin = "round";
+    flowCtx.lineCap = "round";
+    if (kind === "solar") {
+      flowCtx.lineWidth = Math.max(1.2, size * 0.06);
+      var r = size * 0.19;
+      flowCtx.beginPath(); flowCtx.arc(cx, cy, r, 0, Math.PI * 2); flowCtx.fill();
+      for (var i = 0; i < 8; i++) {
+        var ang = (Math.PI * 2 / 8) * i;
+        flowCtx.beginPath();
+        flowCtx.moveTo(cx + Math.cos(ang) * (r + 3), cy + Math.sin(ang) * (r + 3));
+        flowCtx.lineTo(cx + Math.cos(ang) * (r + size * 0.15), cy + Math.sin(ang) * (r + size * 0.15));
+        flowCtx.stroke();
+      }
+    } else if (kind === "grid") {
+      var w = size * 0.34;
+      flowCtx.beginPath();
+      flowCtx.moveTo(cx + w * 0.18, cy - size * 0.32);
+      flowCtx.lineTo(cx - w * 0.42, cy + size * 0.06);
+      flowCtx.lineTo(cx + w * 0.02, cy + size * 0.06);
+      flowCtx.lineTo(cx - w * 0.18, cy + size * 0.32);
+      flowCtx.lineTo(cx + w * 0.42, cy - size * 0.06);
+      flowCtx.lineTo(cx - w * 0.02, cy - size * 0.06);
+      flowCtx.closePath();
+      flowCtx.fill();
+    } else if (kind === "home") {
+      var w = size * 0.6, h = size * 0.52;
+      flowCtx.beginPath();
+      flowCtx.moveTo(cx, cy - h * 0.62);
+      flowCtx.lineTo(cx + w / 2, cy - h * 0.06);
+      flowCtx.lineTo(cx + w * 0.34, cy - h * 0.06);
+      flowCtx.lineTo(cx + w * 0.34, cy + h * 0.44);
+      flowCtx.lineTo(cx - w * 0.34, cy + h * 0.44);
+      flowCtx.lineTo(cx - w * 0.34, cy - h * 0.06);
+      flowCtx.lineTo(cx - w / 2, cy - h * 0.06);
+      flowCtx.closePath();
+      flowCtx.fill();
+    } else if (kind === "ev") {
+      var cw = size * 0.76, ch = size * 0.32, baseY = cy + ch * 0.30;
+      flowCtx.beginPath();
+      flowCtx.moveTo(cx - cw / 2, baseY);
+      flowCtx.lineTo(cx - cw / 2, baseY - ch * 0.34);
+      flowCtx.quadraticCurveTo(cx - cw * 0.40, baseY - ch * 0.95, cx - cw * 0.14, baseY - ch * 0.95);
+      flowCtx.lineTo(cx + cw * 0.12, baseY - ch * 0.95);
+      flowCtx.quadraticCurveTo(cx + cw * 0.40, baseY - ch * 0.95, cx + cw / 2, baseY - ch * 0.34);
+      flowCtx.lineTo(cx + cw / 2, baseY);
+      flowCtx.closePath();
+      flowCtx.fill();
+      var wheelR = size * 0.10;
+      flowCtx.beginPath(); flowCtx.arc(cx - cw * 0.28, baseY, wheelR, 0, Math.PI * 2); flowCtx.fill();
+      flowCtx.beginPath(); flowCtx.arc(cx + cw * 0.28, baseY, wheelR, 0, Math.PI * 2); flowCtx.fill();
+    } else if (kind === "battery") {
+      var bw = size * 0.62, bh = size * 0.36, nub = bw * 0.09, pad = 3;
+      flowCtx.lineWidth = Math.max(1.4, size * 0.055);
+      flowCtx.beginPath();
+      flowRoundedRectPath(cx - bw / 2, cy - bh / 2, bw, bh, 3.5);
+      flowCtx.stroke();
+      flowCtx.beginPath();
+      flowRoundedRectPath(cx + bw / 2 - 0.5, cy - bh * 0.16, nub, bh * 0.32, 1.5);
+      flowCtx.fill();
+      var pct = Math.max(0.06, Math.min(1, socFraction == null ? 1 : socFraction));
+      flowCtx.beginPath();
+      flowRoundedRectPath(cx - bw / 2 + pad, cy - bh / 2 + pad, (bw - pad * 2) * pct, bh - pad * 2, 1.5);
+      flowCtx.fill();
+    }
+    flowCtx.restore();
+  }
+
+  function flowDrawTextStack(pos, startY, lines) {
+    var y = startY;
+    lines.forEach(function (line) {
+      flowCtx.font = line.font;
+      flowCtx.fillStyle = line.color;
+      flowCtx.textAlign = "center";
+      flowCtx.textBaseline = "middle";
+      flowCtx.fillText(line.text, pos.x, y);
+      y += line.lineHeight;
+    });
+  }
+
+  var FLOW_VALUE_FONT = "700 13px system-ui, -apple-system, sans-serif";
+  var FLOW_SECONDARY_FONT = "700 12px system-ui, -apple-system, sans-serif";
+  var FLOW_LABEL_FONT = "500 10px system-ui, -apple-system, sans-serif";
+
+  // textSide "above" puts the value/label stack on the far side of the
+  // circle from Home instead of the near side (default "below") - added
+  // 2026-09-13 for Solar specifically. Home's own ring was overlapping
+  // Solar's label text once the vertical spacing got tight enough, because
+  // the earlier clearance math only accounted for circle-to-circle distance
+  // and forgot the text hanging in the same gap. Putting Solar's text on
+  // the outward side (matching the app's own `.above` layout for its top
+  // node) removes text from that gap entirely, so the gap only has to clear
+  // the two circles - letting the spacing tighten further with no collision
+  // risk. EV (the bottom node) already has this for free: "below" for EV is
+  // already the outward-from-Home direction, so it needs no change.
+  function flowDrawSideNode(pos, radius, iconKind, colorHex, active, lines, socFraction, textSide) {
+    flowCtx.beginPath();
+    flowCtx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+    flowCtx.fillStyle = flowHexToRgba(colorHex, active ? 0.14 : 0.04);
+    flowCtx.fill();
+    flowCtx.lineWidth = 1.5;
+    flowCtx.strokeStyle = flowHexToRgba(colorHex, active ? 0.55 : 0.18);
+    flowCtx.stroke();
+    flowDrawIcon(iconKind, pos.x, pos.y, radius * 1.05, active ? colorHex : flowHexToRgba(colorHex, 0.35), socFraction);
+    if (textSide === "above") {
+      var y = pos.y - radius - 17;
+      for (var i = lines.length - 1; i >= 0; i--) {
+        flowCtx.font = lines[i].font;
+        flowCtx.fillStyle = lines[i].color;
+        flowCtx.textAlign = "center";
+        flowCtx.textBaseline = "middle";
+        flowCtx.fillText(lines[i].text, pos.x, y);
+        y -= (lines[i].lineHeight || 15);
+      }
+    } else {
+      flowDrawTextStack(pos, pos.y + radius + 17, lines);
+    }
+  }
+
+  // Bigger, multi-ring treatment (outer glow + middle ring + solid shadowed
+  // disc) matching the app's EnergyHomeNode, since Home is the aggregation
+  // point and deserves more visual weight than the four spoke nodes.
+  function flowDrawHomeNode(pos, colorHex, connected, valueText) {
+    flowCtx.beginPath(); flowCtx.arc(pos.x, pos.y, 48, 0, Math.PI * 2);
+    flowCtx.fillStyle = flowHexToRgba(colorHex, 0.06); flowCtx.fill();
+    flowCtx.beginPath(); flowCtx.arc(pos.x, pos.y, 40, 0, Math.PI * 2);
+    flowCtx.lineWidth = 1; flowCtx.strokeStyle = flowHexToRgba(colorHex, 0.2); flowCtx.stroke();
+
+    flowCtx.save();
+    flowCtx.shadowColor = "rgba(0,0,0,0.28)"; flowCtx.shadowBlur = 10; flowCtx.shadowOffsetY = 3;
+    flowCtx.beginPath(); flowCtx.arc(pos.x, pos.y, 34, 0, Math.PI * 2);
+    flowCtx.fillStyle = flowColor("--surface-1");
+    flowCtx.fill();
+    flowCtx.restore();
+
+    flowDrawIcon("home", pos.x, pos.y - 12, 22, colorHex);
+    flowDrawTextStack(pos, pos.y + 8, [
+      { text: valueText, font: "700 13px system-ui, -apple-system, sans-serif", color: flowColor("--text-primary"), lineHeight: 12 },
+      { text: "Home", font: FLOW_LABEL_FONT, color: flowColor("--text-muted"), lineHeight: 0 }
+    ]);
+    // Was at +26, overlapping the bottom of the "Home" label text (which
+    // extends to roughly +25) - moved to the solid disc's own bottom edge,
+    // clear of the text, confirmed via screenshot 2026-09-13.
+    flowCtx.beginPath();
+    flowCtx.arc(pos.x, pos.y + 32, 2.4, 0, Math.PI * 2);
+    flowCtx.fillStyle = connected ? "#2ecc71" : flowColor("--status-critical");
+    flowCtx.fill();
+  }
+
+  function flowRender() {
+    var rect = flowCanvas.getBoundingClientRect();
+    if (flowCanvas.width !== Math.round(rect.width * flowDpr) || flowCanvas.height !== Math.round(rect.height * flowDpr)) {
+      flowResize();
+    }
+    flowCtx.clearRect(0, 0, rect.width, rect.height);
+    if (flowLatest) {
+      var colors = {
+        solar: flowColor("--series-solar"), battery: flowColor("--series-battery"),
+        grid: flowColor("--series-grid"), home: flowColor("--series-home"), ev: flowColor("--series-ev")
+      };
+      var pos = flowLayout(rect.width, rect.height);
+      var solar = flowLatest.solar, battery = flowLatest.battery, grid = flowLatest.grid,
+          ev = flowLatest.ev, inverter = flowLatest.inverter, connected = flowLatest.connected;
+
+      var pvPower = solar ? solar.pvPower : 0;
+      var batteryPower = battery ? battery.batteryPower : 0;
+      var gridPower = grid ? grid.gridPower : 0;
+      var evPower = ev ? ev.power : 0;
+      var loadPower = inverter ? inverter.loadPower : 0;
+      var homeNet = Math.max(0, loadPower - evPower);
+      // SoC-based, not the fixed --series-battery token - matches the app's
+      // own socColor(_:), used for both the battery node and its flow line.
+      if (battery) colors.battery = flowSocColorHex(battery.batterySoC);
+
+      if (connected) {
+        if (pvPower > 1) flowDrawLine(pos.solar, pos.center, colors.solar, false, pvPower);
+        if (battery && Math.abs(batteryPower) > 1) flowDrawLine(pos.battery, pos.center, colors.battery, batteryPower < 0, Math.abs(batteryPower));
+        if (grid && Math.abs(gridPower) > 1) flowDrawLine(pos.grid, pos.center, colors.grid, gridPower < 0, Math.abs(gridPower));
+        if (ev && evPower > 1) flowDrawLine(pos.center, pos.ev, colors.ev, false, evPower);
+      }
+
+      flowDrawSideNode(pos.solar, 28, "solar", colors.solar, connected && pvPower > 1, [
+        { text: formatPower(pvPower), font: FLOW_VALUE_FONT, color: connected && pvPower > 1 ? colors.solar : flowColor("--text-muted"), lineHeight: 15 },
+        { text: "Solar", font: FLOW_LABEL_FONT, color: flowColor("--text-muted"), lineHeight: 15 }
+      ], null, "above");
+
+      if (battery) {
+        var battActive = connected && Math.abs(batteryPower) > 1;
+        var battPrimary = battery.batteryFull ? "Full" : (Math.abs(batteryPower) < 15 ? "Idle"
+          : (batteryPower > 0 ? "→ " + formatPower(batteryPower) : "← " + formatPower(Math.abs(batteryPower))));
+        flowDrawSideNode(pos.battery, 28, "battery", colors.battery, battActive, [
+          { text: battPrimary, font: FLOW_VALUE_FONT, color: battActive ? colors.battery : flowColor("--text-muted"), lineHeight: 15 },
+          { text: fmt(battery.batterySoC, 0, "%"), font: FLOW_SECONDARY_FONT, color: flowColor("--text-secondary"), lineHeight: 15 },
+          { text: "Battery", font: FLOW_LABEL_FONT, color: flowColor("--text-muted"), lineHeight: 0 }
+        ], battery.batterySoC / 100);
+      }
+
+      if (grid) {
+        var gridActive = connected && Math.abs(gridPower) > 1;
+        var gridLabel = !gridActive ? "Grid" : (gridPower < 0 ? "Exporting" : "Importing");
+        flowDrawSideNode(pos.grid, 28, "grid", colors.grid, gridActive, [
+          { text: formatPower(Math.abs(gridPower)), font: FLOW_VALUE_FONT, color: gridActive ? colors.grid : flowColor("--text-muted"), lineHeight: 15 },
+          { text: gridLabel, font: FLOW_LABEL_FONT, color: flowColor("--text-muted"), lineHeight: 0 }
+        ]);
+      }
+
+      if (ev) {
+        var evActive = connected && evPower > 1;
+        flowDrawSideNode(pos.ev, 26, "ev", colors.ev, evActive, [
+          { text: formatPower(evPower), font: FLOW_VALUE_FONT, color: evActive ? colors.ev : flowColor("--text-muted"), lineHeight: 15 },
+          { text: "EV", font: FLOW_LABEL_FONT, color: flowColor("--text-muted"), lineHeight: 0 }
+        ]);
+      }
+
+      flowDrawHomeNode(pos.center, colors.home, connected, formatPower(homeNet));
+    }
+    requestAnimationFrame(flowRender);
+  }
+
   function render(data) {
     document.getElementById("deviceName").textContent = data.deviceName || "AlphaESS Inverter";
     document.getElementById("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
@@ -756,19 +1170,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     var solar = data.solar, battery = data.battery, grid = data.grid;
 
-    document.getElementById("pvPower").textContent = formatPower(solar ? solar.pvPower : 0);
-    document.getElementById("gridPower").textContent = formatPower(Math.abs(grid ? grid.gridPower : 0));
-    document.getElementById("gridDirection").textContent = !grid ? "-" :
-      (grid.gridPower < 0 ? "\u2190 Exporting to grid" : (grid.gridPower > 0 ? "\u2192 Importing from grid" : "Idle"));
-
-    document.getElementById("batterySoC").textContent = battery ? fmt(battery.batterySoC, 1, "%") : "-";
-    var bp = battery ? battery.batteryPower : 0;
-    document.getElementById("batteryDirection").textContent = !battery ? "-" :
-      battery.batteryFull ? "\u2713 Full"
-      : (Math.abs(bp) < 15 ? (formatPower(bp) + " \u00b7 Idle")
-        : (bp > 0 ? "\u2193 Discharging \u00b7 " + formatPower(bp) : "\u2191 Charging \u00b7 " + formatPower(Math.abs(bp))));
-
-    document.getElementById("loadPower").textContent = formatPower(data.inverter ? data.inverter.loadPower : 0);
+    flowLatest = { solar: solar, battery: battery, grid: grid, ev: data.ev, inverter: data.inverter, connected: true };
 
     renderSolarDetail(solar);
     renderBatteryDetail(battery);
@@ -802,11 +1204,13 @@ DASHBOARD_HTML = """<!doctype html>
     fetch(url).then(function (res) { return res.json(); }).then(function (data) {
       if (!data.ok) {
         setBanner(data.error || "No AlphaESS Inverter device found");
+        if (flowLatest) flowLatest.connected = false;
         return;
       }
       render(data);
     }).catch(function () {
       setBanner("Could not reach the AlphaESS Modbus plugin");
+      if (flowLatest) flowLatest.connected = false;
     });
   }
 
@@ -814,6 +1218,72 @@ DASHBOARD_HTML = """<!doctype html>
     selectedDeviceId = deviceSelect.value;
     poll();
   });
+
+  // clearTimer tracked so a quick second click (or the "Done" auto-clear
+  // below) can't race a still-pending clear from an earlier call and wipe
+  // out a message that was meant to replace it.
+  var dispatchStatusClearTimer = null;
+  function dispatchStatusMsg(text, isError) {
+    if (dispatchStatusClearTimer) { clearTimeout(dispatchStatusClearTimer); dispatchStatusClearTimer = null; }
+    var el = document.getElementById("dispatchControlStatus");
+    el.textContent = text;
+    el.style.color = isError ? "var(--status-critical)" : "var(--text-muted)";
+  }
+
+  // Same-origin POST to one of the four dashboard_* control endpoints added
+  // 2026-09-13 - params become URL query args (matching the plugin's own
+  // url_query_args convention, same as dashboard_data's ?deviceId=), not a
+  // JSON body, since that's the one HTTP-responder parameter mechanism this
+  // plugin has actually confirmed working.
+  function callDashboardAction(endpoint, params) {
+    var qs = [];
+    Object.keys(params || {}).forEach(function (k) {
+      qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(params[k]));
+    });
+    if (selectedDeviceId) qs.push("deviceId=" + encodeURIComponent(selectedDeviceId));
+    var url = endpoint + (qs.length ? ("?" + qs.join("&")) : "");
+    dispatchStatusMsg("Sending…", false);
+    fetch(url, {method: "POST"}).then(function (res) { return res.json(); }).then(function (data) {
+      if (data.ok) {
+        dispatchStatusMsg("Done — refreshing…", false);
+        setTimeout(poll, 1500);
+        // The regular 5s poll never touches this status line (it only
+        // updates the Dispatch/Battery/Grid cards), so without this it sits
+        // reading "Done - refreshing..." forever after a successful action -
+        // caught live, 2026-09-13.
+        dispatchStatusClearTimer = setTimeout(function () {
+          dispatchStatusMsg("", false);
+          dispatchStatusClearTimer = null;
+        }, 4000);
+      } else {
+        dispatchStatusMsg(data.error || "Request failed - check the plugin log", true);
+      }
+    }).catch(function () {
+      dispatchStatusMsg("Could not reach the plugin", true);
+    });
+  }
+
+  document.getElementById("btnForceCharging").addEventListener("click", function () {
+    callDashboardAction("dashboard_forceCharging", {});
+  });
+  document.getElementById("btnForceDischarging").addEventListener("click", function () {
+    callDashboardAction("dashboard_forceDischarging", {});
+  });
+  document.getElementById("btnStopDispatch").addEventListener("click", function () {
+    callDashboardAction("dashboard_dispatchReset", {});
+  });
+  document.getElementById("btnDispatch").addEventListener("click", function () {
+    callDashboardAction("dashboard_dispatch", {
+      mode: document.getElementById("dispatchMode").value,
+      power: document.getElementById("dispatchPower").value,
+      cutoffSoC: document.getElementById("dispatchCutoffSoc").value,
+      duration: document.getElementById("dispatchDuration").value,
+      pvSwitch: document.getElementById("dispatchPvSwitch").value
+    });
+  });
+
+  flowResize();
+  requestAnimationFrame(flowRender);
 
   poll();
   setInterval(poll, POLL_MS);
@@ -987,6 +1457,27 @@ def _decode_system_time(registers: list) -> str:
     return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
 
 
+def _decode_modbus_string(registers: list) -> str:
+    """Combine packed Modbus registers into an ASCII string (2 bytes/register, high byte first).
+
+    Used only by check_firmware_version_menu_action - nothing else in this
+    plugin needs a string-type register decoded. Confirmed against a live
+    read of the inverter's own Master Software Version field (0x0640,
+    String(10)) - decoded cleanly to a real-looking version string.
+
+    Args:
+        registers (list): Raw registers as returned by pymodbus.
+
+    Returns:
+        str: The decoded string, with trailing NUL padding stripped.
+    """
+    b = bytearray()
+    for r in registers:
+        b.append((r >> 8) & 0xFF)
+        b.append(r & 0xFF)
+    return b.decode("ascii", errors="replace").rstrip("\x00")
+
+
 class _MenuPluginAction:
     """Minimal stand-in for indigo.PluginAction, for MenuItems.xml callbacks
     that call an existing Actions.xml callback directly with no per-call
@@ -999,6 +1490,21 @@ class _MenuPluginAction:
     def __init__(self, device_id: int):
         self.deviceId = device_id
         self.props: dict = {}
+
+
+class _DashboardPluginAction:
+    """Stand-in for indigo.PluginAction used by the dashboard's own HTTP
+    control endpoints (added 2026-09-13). Same shape as _MenuPluginAction
+    (deviceId + props) but with a real, populated props dict built from the
+    inbound HTTP request's query args - so force_charging_action/
+    force_discharging_action/dispatch_action can be called directly with
+    zero duplicated validation/dispatch logic, the same reuse pattern the
+    Plugins-menu items already established for _MenuPluginAction.
+    """
+
+    def __init__(self, device_id: int, props: dict):
+        self.deviceId = device_id
+        self.props = props
 
 
 class Plugin(indigo.PluginBase):
@@ -2283,6 +2789,61 @@ class Plugin(indigo.PluginBase):
             return
         self.force_discharging_action(_MenuPluginAction(dev.id))
 
+    def check_firmware_version_menu_action(self) -> None:
+        """MenuItems.xml callback for the Plugins-menu "Check Firmware Version" item.
+
+        Manually read-only, on demand - not part of the normal poll cycle
+        (see INVERTER_MASTER_SW_VERSION_ADDRESS for why). Reads the inverter's
+        Master Software Version, compares it against inverterFirmwareVersion
+        (this device's own stored value from the last time this was run -
+        persists across polls/restarts as an ordinary Indigo device state,
+        the same mechanism dispatch* readback already relies on), logs
+        whichever of "first check," "unchanged," or "changed" applies, and
+        updates the stored value to match what was just read either way.
+        """
+        dev = self._resolve_single_inverter("Check Firmware Version")
+        if dev is None:
+            return
+
+        address = dev.pluginProps.get("address", "")
+        if not address:
+            self.logger.error(f"{dev.name}: No IP address configured")
+            return
+        try:
+            port = int(dev.pluginProps.get("port", 502))
+            unit_id = int(dev.pluginProps.get("unitId", DEFAULT_UNIT_ID))
+        except (TypeError, ValueError):
+            self.logger.error(f"{dev.name}: Port/Unit ID must be numeric")
+            return
+
+        client = ModbusTcpClient(address, port=port, timeout=5)
+        if not client.connect():
+            self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
+            return
+        try:
+            result = client.read_holding_registers(INVERTER_MASTER_SW_VERSION_ADDRESS, count=5, device_id=unit_id)
+            if result.isError():
+                raise ModbusException(f"error reading firmware version: {result}")
+            current_version = _decode_modbus_string(result.registers)
+        except ModbusException as e:
+            self.logger.error(f"{dev.name}: firmware version read failed - {e}")
+            return
+        finally:
+            client.close()
+
+        previous_version = dev.states.get("inverterFirmwareVersion") or ""
+        if not previous_version:
+            self.logger.info(f"{dev.name}: Firmware version {current_version} (first check - recorded as baseline)")
+        elif previous_version == current_version:
+            self.logger.info(f"{dev.name}: Firmware version {current_version} (unchanged since last check)")
+        else:
+            self.logger.warning(
+                f"{dev.name}: Firmware version changed ({previous_version} -> {current_version}) - "
+                "dispatch-mode behaviour has differed from documentation before on this hardware across "
+                "firmware revisions; worth re-verifying mode/Force Import behaviour against real hardware."
+            )
+        dev.updateStatesOnServer([{"key": "inverterFirmwareVersion", "value": current_version}])
+
     def toggle_debug_logging_menu_action(self) -> None:
         """MenuItems.xml callback for the Plugins-menu "Toggle Debug Logging" item.
 
@@ -2374,12 +2935,27 @@ class Plugin(indigo.PluginBase):
             grid = self._find_child(target.id, "gridDevice")
             error_state = target.errorState or (solar and solar.errorState) or (battery and battery.errorState) or (grid and grid.errorState) or None
 
+            # Optional cross-plugin read for the flow diagram's EV node, added
+            # 2026-09-13 - see the teslaWallConnectorDeviceId field's comment
+            # in Devices.xml. Deliberately tolerant of a stale/deleted device
+            # id (a device the user later removed, or typo'd) - falls back to
+            # null (no EV node) rather than erroring the whole dashboard.
+            ev = None
+            twc_id = (target.pluginProps.get("teslaWallConnectorDeviceId") or "").strip()
+            if twc_id:
+                try:
+                    twc_dev = indigo.devices[int(twc_id)]
+                    ev = {"power": twc_dev.states.get("power", 0)}
+                except (KeyError, ValueError, TypeError):
+                    ev = None
+
             payload = {
                 "ok": True,
                 "deviceId": target.id,
                 "deviceName": target.name,
                 "devices": device_list,
                 "errorState": error_state,
+                "ev": ev,
                 "inverter": {k: target.states.get(k, 0) for k in INVERTER_STATE_KEYS},
                 "solar": {k: solar.states.get(k, 0) for k in SOLAR_STATE_KEYS} if solar else None,
                 "battery": {k: battery.states.get(k, 0) for k in BATTERY_STATE_KEYS} if battery else None,
@@ -2394,3 +2970,155 @@ class Plugin(indigo.PluginBase):
             reply["content"] = json.dumps({"ok": False, "error": "Internal error - see plugin log"})
             reply["headers"] = {"Content-Type": "application/json"}
             return reply
+
+    def _resolve_dashboard_device(self, query: dict) -> Optional[indigo.Device]:
+        """Resolve which AlphaESS Inverter device a dashboard request targets.
+
+        Mirrors dashboard_data's own target resolution exactly, so the
+        dashboard's device selector and its control endpoints always agree
+        on which inverter a click actually affects.
+
+        Args:
+            query (dict): The request's url_query_args - an explicit
+                ``deviceId`` picks a specific device (multi-inverter
+                installs); otherwise the first configured+enabled one.
+
+        Returns:
+            Optional[indigo.Device]: The resolved device, or None if no
+                AlphaESS Inverter device exists/matches.
+        """
+        requested_id = query.get("deviceId")
+        devices = list(indigo.devices.iter("self.inverter"))
+        target = None
+        if requested_id:
+            target = next((d for d in devices if str(d.id) == str(requested_id)), None)
+        if target is None:
+            target = next((d for d in devices if d.enabled and d.configured), None)
+        return target
+
+    def _set_dispatch_owner(self, value: str) -> None:
+        """Best-effort dispatchOwner write, for the dashboard's own control endpoints.
+
+        Coordinates with the Indigo automations (see the AlphaESS Automation
+        Blueprint / dispatchOwner Variable) that gate on this value, the same
+        way the LuminaHome app's own manual dispatch does - set to "manual"
+        before an engaging call, cleared to "none" after a reset, so a
+        dashboard-triggered dispatch can't be silently clobbered by (or
+        itself clobber) an automated one. Deliberately never blocks the
+        actual dispatch call if this Variable happens to be missing/renamed -
+        losing the coordination is a smaller problem than refusing a manual
+        control action the user just asked for.
+
+        Args:
+            value (str): "manual", "none", or one of the other dispatchOwner
+                values a specific automation module owns.
+        """
+        try:
+            indigo.variable.updateValue("dispatchOwner", value=value)
+        except Exception:
+            self.logger.exception(f"Could not update dispatchOwner to '{value}' - continuing anyway")
+
+    def _handle_dashboard_dispatch_request(self, action, *, engage: bool, callback) -> "indigo.Dict":
+        """Shared plumbing for the four dashboard-control HTTP endpoints below.
+
+        Resolves the target device, sets/clears dispatchOwner in the correct
+        order (manual BEFORE an engaging call so no automation can race in
+        between; none AFTER a reset so a reset always fully hands control
+        back), then calls the existing Actions.xml callback directly via
+        _DashboardPluginAction - so all four dashboard buttons run through
+        exactly the same validation/dispatch code as an Action Group step or
+        a Plugins-menu click, never a second copy of it.
+
+        Note: force_charging_action/force_discharging_action/dispatch_action/
+        dispatch_reset_action only ever log their own validation failures
+        (e.g. an out-of-range power value) - they don't raise or return a
+        status - so "ok": true here means "the request was received and
+        processed," not "the dispatch definitely landed." Same posture the
+        Plugins-menu items and Action Group steps already have; a rejected
+        value shows up in the plugin log/Indigo Events log, and the
+        dashboard's own Dispatch card reflects real state on its next poll
+        either way.
+
+        Args:
+            action: The inbound HTTP request wrapper.
+            engage (bool): True for a dispatch-starting call; False for the
+                reset call.
+            callback: The existing Actions.xml callback to invoke.
+
+        Returns:
+            indigo.Dict: A JSON {"ok": bool, "error": str|None} reply.
+        """
+        try:
+            props = dict(action.props) if action is not None else {}
+            query = props.get("url_query_args", {}) or {}
+            dev = self._resolve_dashboard_device(query)
+
+            reply = indigo.Dict()
+            reply["headers"] = {"Content-Type": "application/json"}
+            if dev is None:
+                reply["status"] = 200
+                reply["content"] = json.dumps({"ok": False, "error": "No configured AlphaESS Inverter device found"})
+                return reply
+
+            if engage:
+                self._set_dispatch_owner("manual")
+            callback(_DashboardPluginAction(dev.id, query))
+            if not engage:
+                self._set_dispatch_owner("none")
+
+            reply["status"] = 200
+            reply["content"] = json.dumps({"ok": True})
+            return reply
+        except Exception:
+            self.logger.exception("Error handling dashboard dispatch control request")
+            reply = indigo.Dict()
+            reply["status"] = 500
+            reply["headers"] = {"Content-Type": "application/json"}
+            reply["content"] = json.dumps({"ok": False, "error": "Internal error - see plugin log"})
+            return reply
+
+    def dashboard_force_charging(self, action, dev=None, caller_waiting_for_result=None):
+        """HTTP-reachable dashboard control: Force Charging.
+
+        Reachable at .../message/<pluginId>/dashboard_forceCharging, with an
+        optional ?deviceId= and the same optional power/cutoffSoC/duration
+        overrides as the forceCharging Action (blank = device default).
+
+        Returns:
+            indigo.Dict: See _handle_dashboard_dispatch_request.
+        """
+        return self._handle_dashboard_dispatch_request(action, engage=True, callback=self.force_charging_action)
+
+    def dashboard_force_discharging(self, action, dev=None, caller_waiting_for_result=None):
+        """HTTP-reachable dashboard control: Force Discharging. See dashboard_force_charging.
+
+        Returns:
+            indigo.Dict: See _handle_dashboard_dispatch_request.
+        """
+        return self._handle_dashboard_dispatch_request(action, engage=True, callback=self.force_discharging_action)
+
+    def dashboard_dispatch(self, action, dev=None, caller_waiting_for_result=None):
+        """HTTP-reachable dashboard control: generic Dispatch (all 8 modes).
+
+        Same mode/power/cutoffSoC/duration/pvSwitch query args as the
+        dispatch Action. See dashboard_force_charging.
+
+        Returns:
+            indigo.Dict: See _handle_dashboard_dispatch_request.
+        """
+        return self._handle_dashboard_dispatch_request(action, engage=True, callback=self.dispatch_action)
+
+    def dashboard_dispatch_reset(self, action, dev=None, caller_waiting_for_result=None):
+        """HTTP-reachable dashboard control: Dispatch Reset (Stop).
+
+        Stops any active dispatch AND clears dispatchOwner back to "none" in
+        the same action - deliberately not split into a separate "resume
+        auto" step, same reasoning as the LuminaHome app's own Stop Dispatch:
+        leaving dispatchOwner at "manual" with nothing dispatching would
+        block every automated protection (SoC ceiling, EV hold, top-up) for
+        no benefit.
+
+        Returns:
+            indigo.Dict: See _handle_dashboard_dispatch_request.
+        """
+        return self._handle_dashboard_dispatch_request(action, engage=False, callback=self.dispatch_reset_action)

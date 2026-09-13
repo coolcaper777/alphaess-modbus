@@ -48,6 +48,7 @@ The parent device — holds the connection config, auto-discovers the three devi
 | `invTemperature` | Inverter internal temperature (°C) |
 | `invWorkMode` | Inverter operating mode (`Normal`, `Bypass/EPS`, or `Unknown work mode (N)` for any other model-specific code) |
 | `systemTime` | Inverter's own clock, as reported by the inverter (`YYYY-MM-DD HH:MM:SS`) |
+| `inverterFirmwareVersion` | Inverter's Master Software Version, as of the last **Check Firmware Version** menu click — not read on the normal poll cycle, see the Plugins menu section below |
 | `dispatchActive` | `true` while a Force Charging/Force Discharging/Force Import/Dispatch command is running — read back from the inverter's own dispatch registers every poll, not just tracked from the last action this plugin sent, so it stays correct even if something else (another integration, the inverter's own app) changes dispatch independently |
 | `dispatchType` | Which action started the active dispatch (`forceCharging`/`forceDischarging`/`forceImport`/`dispatch`) — this one *is* just this plugin's own memory of what it last did, since the inverter doesn't track "who" dispatched it |
 | `dispatchModeLabel` | The active dispatch's mode name (e.g. `State of Charge Control`) — read back from the inverter, same as `dispatchActive` |
@@ -123,11 +124,12 @@ A running dispatch auto-stops on its own once its duration elapses — no separa
 
 ## Plugins menu
 
-Indigo's Plugins → AlphaESS Modbus menu has five one-click items, for the common case of exactly one AlphaESS Inverter device configured — with more than one (or zero), each logs an error naming which Action to use in an Action Group instead, since a bare menu click has no device picker of its own:
+Indigo's Plugins → AlphaESS Modbus menu has six one-click items, for the common case of exactly one AlphaESS Inverter device configured — with more than one (or zero), each logs an error naming which Action to use in an Action Group instead, since a bare menu click has no device picker of its own:
 
 - **Poll Now** — reads a fresh set of registers immediately, without waiting for the device's own configured Poll Interval. Purely additive; doesn't disturb the normal polling schedule.
 - **Force Charging** / **Force Discharging** — same as the Actions of the same name, but always using the Inverter device's configured defaults (Power/Cutoff SoC/Duration) with no dialog — a true one-click "top up"/"draw down now". For a specific power/cutoff/duration on a given call, use the Action Group version instead, which still takes its own field overrides exactly as before.
 - **Dispatch Reset (Stop)** — same as the Action of the same name.
+- **Check Firmware Version** — reads the inverter's own Master Software Version on demand (not on the normal poll cycle — it only ever changes when AlphaESS pushes an update, so there's no reason to poll it continuously) and compares it against `inverterFirmwareVersion`, the value stored from the last time this was run. Logs whether it's unchanged or has changed, and updates the stored value either way. Worth running periodically to catch a firmware update AlphaESS pushed via the app/cloud — this project has found real, undocumented differences in dispatch-mode behavior across firmware revisions more than once.
 - **Toggle Debug Logging** — flips debug logging on/off, the same as saving the Configure dialog's checkbox, just without opening it.
 
 ## Debug logging

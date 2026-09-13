@@ -91,6 +91,19 @@
                 <Label>Force Import Duration (min):</Label>
                 <Description>Valid range: 0-480 min (8 hours)</Description>
             </Field>
+            <Field id="dashboardSeparator" type="separator"/>
+            <!-- Optional cross-plugin read, added 2026-09-13 for the dashboard's
+                 flow diagram EV node. Indigo doesn't restrict a plugin from
+                 reading another plugin's device states (only calling its
+                 Actions needs plugin.executeAction) - this just looks up
+                 com.coolcaper.teslawallconnector's own "wallConnector" device
+                 by id and reads its "power" state (Integer, watts). Blank =
+                 no EV node, same optional-hide pattern as everywhere else in
+                 this project that treats EV as not everyone having one. -->
+            <Field id="teslaWallConnectorDeviceId" type="textfield">
+                <Label>Tesla Wall Connector Device ID:</Label>
+                <Description>Optional - adds an EV node to the dashboard's flow diagram. Leave blank if you don't have one, or don't want it shown here.</Description>
+            </Field>
         </ConfigUI>
         <States>
             <State id="loadPower">
@@ -114,6 +127,11 @@
                 <ValueType>String</ValueType>
                 <TriggerLabel>Inverter System Time Changed</TriggerLabel>
                 <ControlPageLabel>System Time</ControlPageLabel>
+            </State>
+            <State id="inverterFirmwareVersion">
+                <ValueType>String</ValueType>
+                <TriggerLabel>Inverter Firmware Version Changed</TriggerLabel>
+                <ControlPageLabel>Inverter Firmware Version</ControlPageLabel>
             </State>
             <State id="dispatchActive">
                 <ValueType>Boolean</ValueType>

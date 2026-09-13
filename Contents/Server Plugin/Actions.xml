@@ -13,6 +13,27 @@
         <Name>AlphaESS dashboard live data</Name>
         <CallbackMethod>dashboard_data</CallbackMethod>
     </Action>
+    <!-- Dashboard control endpoints, added 2026-09-13 - let the web dashboard
+         itself trigger dispatch, not just display it. Each just forwards to
+         the real Actions.xml callback below via a small props-carrying
+         stand-in (_DashboardPluginAction), so there is exactly one copy of
+         the actual validation/dispatch logic anywhere in this plugin. -->
+    <Action id="dashboard_forceCharging" uiPath="hidden">
+        <Name>AlphaESS dashboard: Force Charging</Name>
+        <CallbackMethod>dashboard_force_charging</CallbackMethod>
+    </Action>
+    <Action id="dashboard_forceDischarging" uiPath="hidden">
+        <Name>AlphaESS dashboard: Force Discharging</Name>
+        <CallbackMethod>dashboard_force_discharging</CallbackMethod>
+    </Action>
+    <Action id="dashboard_dispatch" uiPath="hidden">
+        <Name>AlphaESS dashboard: Dispatch (Advanced)</Name>
+        <CallbackMethod>dashboard_dispatch</CallbackMethod>
+    </Action>
+    <Action id="dashboard_dispatchReset" uiPath="hidden">
+        <Name>AlphaESS dashboard: Dispatch Reset</Name>
+        <CallbackMethod>dashboard_dispatch_reset</CallbackMethod>
+    </Action>
 
     <!-- Dispatch actions - write the 11-register Dispatch block (0x0880-0x088A),
          confirmed NOT flash-backed (see plugin.py's DISPATCH_START_ADDRESS

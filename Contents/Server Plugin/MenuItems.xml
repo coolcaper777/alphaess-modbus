@@ -23,6 +23,11 @@
         <Name>Dispatch Reset (Stop)</Name>
         <CallbackMethod>dispatch_reset_menu_action</CallbackMethod>
     </MenuItem>
+    <MenuItem id="firmwareSeparator" type="separator" />
+    <MenuItem id="checkFirmwareVersionMenu">
+        <Name>Check Firmware Version</Name>
+        <CallbackMethod>check_firmware_version_menu_action</CallbackMethod>
+    </MenuItem>
     <MenuItem id="debugSeparator" type="separator" />
     <MenuItem id="toggleDebugLoggingMenu">
         <Name>Toggle Debug Logging</Name>
