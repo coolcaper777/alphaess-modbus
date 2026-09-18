@@ -2702,7 +2702,16 @@ class Plugin(indigo.PluginBase):
             pluginAction (indigo.PluginAction): The action instance, including ``deviceId``.
         """
         dev = indigo.devices[pluginAction.deviceId]
-        self._stop_dispatch(dev, reason="user requested")
+        # Deliberately not "user requested" - this single Actions.xml callback
+        # is invoked identically for a Schedule/Trigger's Action Group step,
+        # the LuminaHome app's HTTP command, and the web dashboard's Stop
+        # button (dashboard_dispatch_reset calls straight through to this
+        # method as its callback). Indigo gives the plugin no way to tell
+        # those apart from inside a PluginAction callback, so claiming
+        # "user requested" was actively misleading whenever a Schedule (e.g.
+        # A1b/A2's daily resets) was the real caller - confirmed 2026-09-17
+        # by finding those exact Schedules logging that exact phrase.
+        self._stop_dispatch(dev, reason="Dispatch Reset action")
 
     def _resolve_single_inverter(self, menu_label: str) -> Optional[indigo.Device]:
         """Resolve the one AlphaESS Inverter device for a bare Plugins-menu item.
@@ -2742,7 +2751,10 @@ class Plugin(indigo.PluginBase):
         dev = self._resolve_single_inverter("Dispatch Reset (Stop)")
         if dev is None:
             return
-        self._stop_dispatch(dev, reason="user requested (menu)")
+        # Unlike dispatch_reset_action above, this one really is always a
+        # person - it's only reachable by clicking the Plugins menu item
+        # directly on the Indigo server.
+        self._stop_dispatch(dev, reason="Plugins menu")
 
     def poll_now_menu_action(self) -> None:
         """MenuItems.xml callback for the Plugins-menu "Poll Now" item.
