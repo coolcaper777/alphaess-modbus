@@ -20,7 +20,7 @@ An [Indigo Domotics](https://www.indigodomo.com/) plugin that reads **AlphaESS**
 
 ## What it does
 
-- Polls the inverter's Modbus TCP interface once per cycle (default: every 30s, configurable per device) and fans the result out across four devices — AlphaESS inverters only accept **one** Modbus TCP connection at a time, so everything shares that single connection rather than each device polling independently.
+- Polls the inverter's Modbus TCP interface once per cycle (default: every 30s, configurable per device) and fans the result out across four devices — AlphaESS inverters only accept **one** Modbus TCP connection at a time, so everything shares that single connection rather than each device polling independently. The plugin's own poll and dispatch-write calls are serialized against each other internally (a per-inverter lock), so they can't collide with one another.
 - Computes house load as `pvPower + batteryPower + gridPower` — whichever combination is currently supplying the house.
 - Serves a self-contained live dashboard (no login, polls every 5s) at:
   `http://<indigo-host>:8176/message/com.coolcaper.alphaessmodbus/dashboard`
@@ -88,6 +88,8 @@ Auto-created under the Inverter.
 
 A battery-less installation is currently **untested** — if you run one and see a `Modbus read error` on this device rather than sensible `0` values, please open an issue with your plugin log. It won't affect the Solar or Grid devices either way, since each is read and reported independently.
 
+The dashboard's Battery detail card shows an explicit Idle/Charging/Discharging status line (Idle when `|batteryPower|` is under 15W) alongside its existing time-to-empty/full estimate, rather than only showing the latter.
+
 ### AlphaESS Grid (`gridDevice`)
 
 Auto-created under the Inverter.
@@ -140,7 +142,7 @@ Dispatch start (in the Event Log, without needing debug on) always includes the 
 
 ## Troubleshooting
 
-- **"Connection failed":** confirm the IP/port are correct and the inverter is reachable on your local network. AlphaESS inverters accept only **one** Modbus TCP connection at a time — if something else (e.g. Home Assistant) already holds that connection, this plugin's connection attempts will fail. A small TCP proxy (e.g. [`modbus-proxy`](https://github.com/tiagocoutinho/modbus-proxy)) in front of the inverter lets multiple clients share it.
+- **"Connection failed"** (on a register poll) **/ "could not connect ... cannot send dispatch command"** (on a dispatch write): confirm the IP/port are correct and the inverter is reachable on your local network. AlphaESS inverters accept only **one** Modbus TCP connection at a time; this plugin's own poll and dispatch calls are already serialized against each other (see `ARCHITECTURE.md`'s "Single-connection limitation" section), and a dispatch write additionally retries a failed connect up to twice (300ms/600ms backoff) to absorb the inverter's own brief recovery window between connections. If the error persists, something external (e.g. Home Assistant) is likely already holding the one available connection — a small TCP proxy (e.g. [`modbus-proxy`](https://github.com/tiagocoutinho/modbus-proxy)) in front of the inverter lets multiple clients share it.
 - **"Modbus read error" on one of the three child devices:** a read failure isolated to that device's data only — Solar/Battery/Grid are each read and reported independently, so this doesn't affect the other two. Retries automatically on the next poll interval.
 - **"Partial read this cycle - ... unavailable" on the Inverter device:** one or more of Solar/Battery/Grid failed to read this cycle (see that device for the specific error) — `loadPower` is skipped rather than computed from incomplete data until all three succeed again.
 - **"Invalid Port or Unit ID":** the Port or Unit/Slave ID field isn't a plain number.
