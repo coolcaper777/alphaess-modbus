@@ -6,6 +6,7 @@ except ImportError:
 import json
 import logging
 import re
+import threading
 import time
 from typing import Optional
 
@@ -681,7 +682,12 @@ DASHBOARD_HTML = """<!doctype html>
     container.appendChild(row("Lifetime discharge", fmt(battery.batteryDischargeEnergy, 1, "kWh")));
     if (battery.batteryFull) {
       container.appendChild(row("Status", "Full"));
-    } else if (battery.batteryRemainingTime > 0) {
+    } else if (Math.abs(battery.batteryPower) < 15) {
+      container.appendChild(row("Status", "Idle"));
+    } else {
+      container.appendChild(row("Status", battery.batteryPower > 0 ? "Discharging" : "Charging"));
+    }
+    if (!battery.batteryFull && battery.batteryRemainingTime > 0) {
       var label = battery.batteryPower > 0 ? "Time to empty" : "Time to full";
       container.appendChild(row(label, formatMinutes(battery.batteryRemainingTime)));
     }
@@ -1534,6 +1540,30 @@ class Plugin(indigo.PluginBase):
         # cleared in _stop_dispatch so every stop path (explicit reset,
         # duration auto-off, or the servo's own early-stop) tears it down.
         self._force_import_state: dict = {}
+        # inverter device id -> threading.Lock serializing every open-connect-
+        # use-close span against that device's Modbus TCP connection. A real
+        # AlphaESS inverter only accepts ONE Modbus TCP connection at a time
+        # (ECONNREFUSED on a second concurrent one) - the poll loop
+        # (_poll_inverter, its own thread) and the dispatch-write actions
+        # (force_charging_action etc., Indigo's action-dispatch thread) each
+        # open their own client independently, so without this lock a
+        # dispatch action firing mid-poll would collide with the inverter.
+        # Now connecting directly to the inverter (2026-10-12, modbus-proxy
+        # decommissioned - see _get_modbus_lock) rather than through a proxy
+        # that used to serialize this for free.
+        self._modbus_locks: dict = {}
+
+    def _get_modbus_lock(self, dev_id: int) -> threading.Lock:
+        """Return this inverter device's own Modbus-connection lock, creating it on first use.
+
+        Args:
+            dev_id (int): The AlphaESS Inverter device's id.
+
+        Returns:
+            threading.Lock: The lock to hold for the full span of any single
+                open-connect-use-close cycle against this device's inverter.
+        """
+        return self._modbus_locks.setdefault(dev_id, threading.Lock())
 
     def startup(self) -> None:
         """Called once by Indigo when the plugin starts running."""
@@ -1835,49 +1865,50 @@ class Plugin(indigo.PluginBase):
             )
             return
 
-        client = ModbusTcpClient(address, port=port, timeout=5)
-        if not client.connect():
-            message = "Connection failed"
-            dev.setErrorStateOnServer(message)
-            self._set_children_error(dev, message)
-            self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
-            return
+        with self._get_modbus_lock(dev.id):
+            client = ModbusTcpClient(address, port=port, timeout=5)
+            if not client.connect():
+                message = "Connection failed"
+                dev.setErrorStateOnServer(message)
+                self._set_children_error(dev, message)
+                self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
+                return
 
-        try:
-            values = {}
-            cluster_registers = {}
-            cluster_errors = {}
-            for start, count in REGISTER_CLUSTERS:
-                try:
-                    result = client.read_holding_registers(start, count=count, device_id=unit_id)
-                    if result.isError():
-                        raise ModbusException(f"error reading registers {start}-{start + count - 1}: {result}")
-                except ModbusException as e:
-                    # Isolated per cluster rather than aborting the whole poll -
-                    # e.g. a battery-less installation refusing the battery
-                    # cluster shouldn't also stop Grid/Solar from updating.
-                    cluster_errors[start] = str(e)
-                    self.logger.error(f"{dev.name}: {e}")
-                    continue
-                cluster_registers[start] = result.registers
-                for name, spec in REGISTERS.items():
-                    if start <= spec["address"] and spec["address"] + spec["words"] <= start + count:
-                        offset = spec["address"] - start
-                        regs = result.registers[offset: offset + spec["words"]]
-                        values[name] = _decode_value(regs, spec["signed"], spec["decimals"])
-                        self.logger.debug(f"{dev.name}: {name} = {values[name]} (raw {regs})")
-        except Exception:
-            # Anything not already modeled above (e.g. a decode bug) would
-            # otherwise only get logged by runConcurrentThread's outer
-            # try/except - leaving the device looking fine (green) in
-            # Indigo's device list while it silently stops updating.
-            message = "Unexpected error - see plugin log"
-            dev.setErrorStateOnServer(message)
-            self._set_children_error(dev, message)
-            self.logger.exception(f"{dev.name}: unexpected error while polling")
-            return
-        finally:
-            client.close()
+            try:
+                values = {}
+                cluster_registers = {}
+                cluster_errors = {}
+                for start, count in REGISTER_CLUSTERS:
+                    try:
+                        result = client.read_holding_registers(start, count=count, device_id=unit_id)
+                        if result.isError():
+                            raise ModbusException(f"error reading registers {start}-{start + count - 1}: {result}")
+                    except ModbusException as e:
+                        # Isolated per cluster rather than aborting the whole poll -
+                        # e.g. a battery-less installation refusing the battery
+                        # cluster shouldn't also stop Grid/Solar from updating.
+                        cluster_errors[start] = str(e)
+                        self.logger.error(f"{dev.name}: {e}")
+                        continue
+                    cluster_registers[start] = result.registers
+                    for name, spec in REGISTERS.items():
+                        if start <= spec["address"] and spec["address"] + spec["words"] <= start + count:
+                            offset = spec["address"] - start
+                            regs = result.registers[offset: offset + spec["words"]]
+                            values[name] = _decode_value(regs, spec["signed"], spec["decimals"])
+                            self.logger.debug(f"{dev.name}: {name} = {values[name]} (raw {regs})")
+            except Exception:
+                # Anything not already modeled above (e.g. a decode bug) would
+                # otherwise only get logged by runConcurrentThread's outer
+                # try/except - leaving the device looking fine (green) in
+                # Indigo's device list while it silently stops updating.
+                message = "Unexpected error - see plugin log"
+                dev.setErrorStateOnServer(message)
+                self._set_children_error(dev, message)
+                self.logger.exception(f"{dev.name}: unexpected error while polling")
+                return
+            finally:
+                client.close()
 
         grid_ok = GRID_CLUSTER_START in cluster_registers
         battery_ok = BATTERY_CLUSTER_START in cluster_registers
@@ -2098,11 +2129,34 @@ class Plugin(indigo.PluginBase):
         except (TypeError, ValueError):
             self.logger.error(f"{dev.name}: Invalid Port or Unit ID - cannot send dispatch command")
             return None
-        client = ModbusTcpClient(address, port=port, timeout=5)
-        if not client.connect():
-            self.logger.error(f"{dev.name}: could not connect to {address}:{port} - cannot send dispatch command")
-            return None
-        return client, unit_id
+
+        # A dispatch write is one-shot and often time-critical (e.g. an
+        # EV-charging-start trigger firing a SoC hold-ceiling command the
+        # instant it's needed) - unlike a poll tick, which just tries again
+        # next interval regardless. This inverter is polled every 5s (its
+        # pollInterval floor) to drive the live flow dashboard, and its
+        # embedded Modbus/TCP stack appears to need a brief moment to fully
+        # release a connection before it'll accept the next one; a dispatch
+        # connect landing in that window gets refused outright. Confirmed
+        # against the 2026-10-25 EV-charging incident: a hold-ceiling write
+        # hit exactly this window, was never retried, and the battery
+        # discharged intermittently for the rest of that charge session.
+        # time.sleep (not self.sleep) deliberately - this runs on the
+        # calling action/trigger thread, not the plugin's own background
+        # thread, so there's no self.StopThread to cooperate with here.
+        delays = (0, 0.3, 0.6)
+        for attempt, delay in enumerate(delays):
+            if delay:
+                time.sleep(delay)
+            client = ModbusTcpClient(address, port=port, timeout=5)
+            if client.connect():
+                return client, unit_id
+            client.close()
+            if attempt < len(delays) - 1:
+                self.logger.debug(f"{dev.name}: connect attempt {attempt + 1} to {address}:{port} failed, retrying")
+
+        self.logger.error(f"{dev.name}: could not connect to {address}:{port} - cannot send dispatch command")
+        return None
 
     @staticmethod
     def _resolve_number(override, device_default, fallback: float) -> float:
@@ -2214,18 +2268,19 @@ class Plugin(indigo.PluginBase):
                 by force_import_action to avoid tracking servo state for a
                 dispatch that was never actually established.
         """
-        opened = self._open_dispatch_client(dev)
-        if opened is None:
-            return False
-        client, unit_id = opened
-        try:
-            self._write_dispatch(client, unit_id, power_raw=power_raw, mode=mode, soc_raw=soc_raw,
-                                  duration_s=duration_s, pv_switch=pv_switch)
-        except ModbusException:
-            self.logger.exception(f"{dev.name}: error writing dispatch command")
-            return False
-        finally:
-            client.close()
+        with self._get_modbus_lock(dev.id):
+            opened = self._open_dispatch_client(dev)
+            if opened is None:
+                return False
+            client, unit_id = opened
+            try:
+                self._write_dispatch(client, unit_id, power_raw=power_raw, mode=mode, soc_raw=soc_raw,
+                                      duration_s=duration_s, pv_switch=pv_switch)
+            except ModbusException:
+                self.logger.exception(f"{dev.name}: error writing dispatch command")
+                return False
+            finally:
+                client.close()
 
         end_at = time.time() + duration_s
         self._dispatch_end_at[dev.id] = end_at
@@ -2259,19 +2314,20 @@ class Plugin(indigo.PluginBase):
         """
         self._dispatch_end_at.pop(dev.id, None)
         self._force_import_state.pop(dev.id, None)
-        opened = self._open_dispatch_client(dev)
-        if opened is None:
-            return
-        client, unit_id = opened
-        try:
-            result = client.write_registers(DISPATCH_START_ADDRESS, [0] * 11, device_id=unit_id)
-            if result.isError():
-                raise ModbusException(f"error writing dispatch stop: {result}")
-        except ModbusException:
-            self.logger.exception(f"{dev.name}: error stopping dispatch")
-            return
-        finally:
-            client.close()
+        with self._get_modbus_lock(dev.id):
+            opened = self._open_dispatch_client(dev)
+            if opened is None:
+                return
+            client, unit_id = opened
+            try:
+                result = client.write_registers(DISPATCH_START_ADDRESS, [0] * 11, device_id=unit_id)
+                if result.isError():
+                    raise ModbusException(f"error writing dispatch stop: {result}")
+            except ModbusException:
+                self.logger.exception(f"{dev.name}: error stopping dispatch")
+                return
+            finally:
+                client.close()
 
         self.logger.info(f"{dev.name}: Dispatch stopped ({reason})")
         dev.updateStatesOnServer([
@@ -2418,34 +2474,35 @@ class Plugin(indigo.PluginBase):
                     else "PV output clipping against AC limit" if clipping
                     else "target unreachable without draining the battery"
                 )
-                opened = self._open_dispatch_client(dev)
-                if opened is not None:
-                    client, unit_id = opened
-                    try:
-                        result = client.write_registers(
-                            DISPATCH_START_ADDRESS,
-                            [0, 0, 32000, 0, 32000, 0, 0, 0, 90, DISPATCH_FLOW_DIRECTION, DISPATCH_PV_UNCHANGED],
-                            device_id=unit_id,
-                        )
-                        if result.isError():
-                            raise ModbusException(f"error writing dispatch pause: {result}")
-                        state["paused"] = True
-                        state["last_power_raw"] = 32000
-                        state["last_write_time"] = time.time()
-                        state["near_zero_since"] = None
-                        state["near_zero_count"] = 0
-                        pv_txt = f"{pv_power:.0f}W" if pv_power is not None else "?"
-                        load_txt = f"{load_power:.0f}W" if load_power is not None else "?"
-                        batt_txt = f"{battery_power:.0f}W" if battery_ok and battery_power is not None else "?"
-                        self.logger.warning(
-                            f"{dev.name}: Force Import paused - {reason} "
-                            f"(pv={pv_txt} load={load_txt} battery={batt_txt} target={state['target_import_w']:.0f}W)"
-                        )
-                        dev.updateStatesOnServer([{"key": "dispatchModeLabel", "value": f"Force Import - Paused ({reason})"}])
-                    except ModbusException:
-                        self.logger.exception(f"{dev.name}: error pausing Force Import")
-                    finally:
-                        client.close()
+                with self._get_modbus_lock(dev.id):
+                    opened = self._open_dispatch_client(dev)
+                    if opened is not None:
+                        client, unit_id = opened
+                        try:
+                            result = client.write_registers(
+                                DISPATCH_START_ADDRESS,
+                                [0, 0, 32000, 0, 32000, 0, 0, 0, 90, DISPATCH_FLOW_DIRECTION, DISPATCH_PV_UNCHANGED],
+                                device_id=unit_id,
+                            )
+                            if result.isError():
+                                raise ModbusException(f"error writing dispatch pause: {result}")
+                            state["paused"] = True
+                            state["last_power_raw"] = 32000
+                            state["last_write_time"] = time.time()
+                            state["near_zero_since"] = None
+                            state["near_zero_count"] = 0
+                            pv_txt = f"{pv_power:.0f}W" if pv_power is not None else "?"
+                            load_txt = f"{load_power:.0f}W" if load_power is not None else "?"
+                            batt_txt = f"{battery_power:.0f}W" if battery_ok and battery_power is not None else "?"
+                            self.logger.warning(
+                                f"{dev.name}: Force Import paused - {reason} "
+                                f"(pv={pv_txt} load={load_txt} battery={batt_txt} target={state['target_import_w']:.0f}W)"
+                            )
+                            dev.updateStatesOnServer([{"key": "dispatchModeLabel", "value": f"Force Import - Paused ({reason})"}])
+                        except ModbusException:
+                            self.logger.exception(f"{dev.name}: error pausing Force Import")
+                        finally:
+                            client.close()
                 return
 
         if battery_ok and battery_power is not None:
@@ -2471,20 +2528,21 @@ class Plugin(indigo.PluginBase):
         if not (changed or stale):
             return
 
-        opened = self._open_dispatch_client(dev)
-        if opened is None:
-            return
-        client, unit_id = opened
-        try:
-            self._write_dispatch(
-                client, unit_id, power_raw=word, mode=DISPATCH_MODE_SOC_CONTROL,
-                soc_raw=state["soc_raw"], duration_s=state["duration_s"],
-            )
-        except ModbusException:
-            self.logger.exception(f"{dev.name}: error servoing Force Import setpoint")
-            return
-        finally:
-            client.close()
+        with self._get_modbus_lock(dev.id):
+            opened = self._open_dispatch_client(dev)
+            if opened is None:
+                return
+            client, unit_id = opened
+            try:
+                self._write_dispatch(
+                    client, unit_id, power_raw=word, mode=DISPATCH_MODE_SOC_CONTROL,
+                    soc_raw=state["soc_raw"], duration_s=state["duration_s"],
+                )
+            except ModbusException:
+                self.logger.exception(f"{dev.name}: error servoing Force Import setpoint")
+                return
+            finally:
+                client.close()
 
         state["last_power_raw"] = word
         state["last_write_time"] = now
@@ -2828,20 +2886,21 @@ class Plugin(indigo.PluginBase):
             self.logger.error(f"{dev.name}: Port/Unit ID must be numeric")
             return
 
-        client = ModbusTcpClient(address, port=port, timeout=5)
-        if not client.connect():
-            self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
-            return
-        try:
-            result = client.read_holding_registers(INVERTER_MASTER_SW_VERSION_ADDRESS, count=5, device_id=unit_id)
-            if result.isError():
-                raise ModbusException(f"error reading firmware version: {result}")
-            current_version = _decode_modbus_string(result.registers)
-        except ModbusException as e:
-            self.logger.error(f"{dev.name}: firmware version read failed - {e}")
-            return
-        finally:
-            client.close()
+        with self._get_modbus_lock(dev.id):
+            client = ModbusTcpClient(address, port=port, timeout=5)
+            if not client.connect():
+                self.logger.error(f"{dev.name}: could not connect to {address}:{port}")
+                return
+            try:
+                result = client.read_holding_registers(INVERTER_MASTER_SW_VERSION_ADDRESS, count=5, device_id=unit_id)
+                if result.isError():
+                    raise ModbusException(f"error reading firmware version: {result}")
+                current_version = _decode_modbus_string(result.registers)
+            except ModbusException as e:
+                self.logger.error(f"{dev.name}: firmware version read failed - {e}")
+                return
+            finally:
+                client.close()
 
         previous_version = dev.states.get("inverterFirmwareVersion") or ""
         if not previous_version:
