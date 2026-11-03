@@ -1526,6 +1526,13 @@ class Plugin(indigo.PluginBase):
         super().__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
         self.debug = self.pluginPrefs.get("showDebugInfo", False)
         self.indigo_log_handler.setLevel(logging.DEBUG if self.debug else logging.INFO)
+        self.logger.info(f"Indigo API Version detected: {indigo.server.apiVersion}")
+        try:
+            api_version = float(indigo.server.apiVersion)
+        except (TypeError, ValueError):
+            api_version = 0.0
+        if api_version <= 3:
+            self.logger.error(f"API version too old! Requires greater than 3.0, got {indigo.server.apiVersion}")
         self._next_poll_at: dict = {}
         # inverter device id -> epoch time an active dispatch should auto-stop.
         # Checked on runConcurrentThread's 5-second tick (independent of each
