@@ -1873,8 +1873,25 @@ class Plugin(indigo.PluginBase):
             return
 
         with self._get_modbus_lock(dev.id):
-            client = ModbusTcpClient(address, port=port, timeout=5)
-            if not client.connect():
+            # Mirrors _open_dispatch_client's retry: this inverter's embedded
+            # Modbus/TCP stack needs a brief moment to release a connection
+            # before accepting the next one, so a poll landing in that window
+            # gets refused outright otherwise (seen 2026-11-01 and again on a
+            # plugin restart 2026-11-03). self.sleep (not time.sleep) here -
+            # unlike _open_dispatch_client, this runs on the plugin's own
+            # runConcurrentThread, so a delay should stay interruptible via
+            # self.StopThread on shutdown/restart.
+            delays = (0, 0.3, 0.6)
+            for attempt, delay in enumerate(delays):
+                if delay:
+                    self.sleep(delay)
+                client = ModbusTcpClient(address, port=port, timeout=5)
+                if client.connect():
+                    break
+                client.close()
+                if attempt < len(delays) - 1:
+                    self.logger.debug(f"{dev.name}: connect attempt {attempt + 1} to {address}:{port} failed, retrying")
+            else:
                 message = "Connection failed"
                 dev.setErrorStateOnServer(message)
                 self._set_children_error(dev, message)
